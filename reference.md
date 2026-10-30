@@ -73,18 +73,69 @@ Release-specific findings and handling:
   before restoring RX, with a bounded wait and FIFO cleanup.
 - get_data_rate() combines disjoint bits with AND and cannot report the selected
   rate correctly. RF_SETUP is read directly to check rate/PA/carrier bits.
-  get_crc_bytes() has inverted enable logic; CONFIG is checked directly.
+  Readback masks only bit 0 (`0xfe`), which Nordic's register map marks obsolete
+  and don't-care; both values are accepted. Rate, MIN power, carrier, PLL and
+  reserved bits remain checked. get_crc_bytes() has inverted enable logic;
+  CONFIG is checked directly.
 - Constructor/setters toggle CE. A pigpio facade holds CE low through configuration
   and readback, clears stale carrier settings and tracks SPI handles even if
-  construction fails. No constant-carrier entry point is exposed.
+  construction fails. It writes CE low before construction and before forwarding
+  output-mode selection. In [pigpio v78 source](https://raw.githubusercontent.com/joan2937/pigpio/v78/pigpio.c),
+  `gpioSetMode` retains the latch; `gpioWrite` sets the level before selecting
+  output. Suppressing explicit high writes alone did not cover a retained-high
+  input latch. No constant-carrier entry point is exposed.
 - Explicit loopback/port bypass pigpio environment defaults. Command socket timeout
-  and CLI watchdog bound ordinary stalled-daemon failures.
+  and CLI watchdog bound ordinary stalled-daemon failures. The 100 ms send budget
+  now starts before settling/preparation, and receive checks expiry after readiness
+  and payload calls. The socket facade passes the remaining budget to every
+  send/sendall/recv, including pigpio's repeated `_rxbuf` reads. A partial or
+  timed-out command stream is invalidated rather than reused for cleanup.
+- RX recovery and close each have a shared 200 ms allowance. Recovery failure
+  disconnects without a second cleanup attempt. pigpio 1.78 `stop()` normally
+  calls `_notify.stop()`, which sends on a separate, unbounded socket. With no
+  callbacks used here, the adapter stops notifications by local shutdown/close
+  before `pi.stop()` closes the command socket. No thread join or daemon reply
+  is awaited. This is pinned-release handling, not a general pigpio facade.
 
-Host evidence: the released wheel was loaded with an original fake SPI/pigpio
-device, without a daemon or hardware. Twelve combinations (two roles, two rates,
-ACK/MAX_RT/timeout) passed initialization, status, receive and cleanup checks.
-The regular harness uses the original fake driver and SPI model in tests/test_radio.py.
-This establishes API behavior under simulation only.
+## Repair cycle 1 host evidence (2026-10-30)
+
+Independent review identified CE latch exposure, incomplete I/O deadlines and
+the obsolete-bit readback requirement. This targeted repair addresses all three;
+no protocol or legacy behavior is changed. The original 43 tests are unchanged.
+`python3 harness.py check` passes 60 tests, including 17 new regressions in
+`tests/test_radio_repair.py`. `git diff --check` passes. No additional independent
+audit is claimed or requested by this repair.
+
+`python3 tests/probe_radio_release.py /downloads/driver-deps` passes 21 tests using
+the exact wheels above, imported directly without installation. Original fake
+GPIO/SPI and command sockets are used; no daemon constructor or physical access
+is invoked. Coverage includes:
+
+- 64 nrf24 combinations: two roles, two rates, two bit-0 values, and four statuses
+  (TX_DS, MAX_RT, both, neither). MAX_RT takes precedence. A further 48 combinations
+  run both released libraries together over fake daemon/SPI replies.
+- Retained-high input latch plus failed readback, both rates: first GPIO action
+  is write-low; no modeled CE-high transition occurs. Failed initial write never
+  reaches the driver constructor. Partial initialization still closes its handle.
+- Both bit-0 readback values pass. Flipping any other RF_SETUP bit fails readback
+  before enabling CE, at both rates.
+- The review's 20 ms per GPIO/SPI-call model (which deliberately ignores socket
+  timeouts) now returns `False` for send after 245 ms including RX recovery and
+  `None` for a 10 ms receive after its first 20 ms call. Post-call checks reject
+  late results; this deliberately uninterruptible fake can overshoot a budget.
+- With both released libraries and timeout-respecting fake sockets at 20 ms per
+  socket phase, send stops with an error at 100 ms and receive at 10 ms, at both
+  rates. Neither accepts late success. A stalled close stops at 200 ms total.
+  Partial replies invalidate the stream and disconnect without more commands.
+- Trickled SPI payload: 20 ms per socket phase completes four phases in 80 ms
+  under a 100 ms budget; a 70 ms budget interrupts the fourth phase at 70 ms.
+  Expiry between command and reply also invalidates the stream. Notification
+  cleanup issues no socket send, even with a modeled stalled notification socket.
+
+These are injected-clock host results, not wall-clock real-time guarantees,
+independent review, ARM execution, electrical checks or RF measurements. The
+candidate policy still excludes these scoped paths and is unchanged; owner review
+and parent publication remain separate. No further audit round is performed.
 
 ## Chip documentation versus owner RF proposal
 
