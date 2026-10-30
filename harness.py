@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import unittest
 
 ROOT = Path(__file__).resolve().parent
 
@@ -37,6 +38,9 @@ def main():
         if isinstance(node, ast.ImportFrom):
             assert node.module in allowed, "layer violation"
     run(sys.executable, "-m", "compileall", "-q", "transfer.py", "quick_mode.py")
+    suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
+    if suite.countTestCases() < 8:
+        raise ValueError("test discovery found fewer than eight baseline tests")
     run(sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v")
     if sys.argv[1] == "candidate":
         if len(sys.argv) != 3 or not sys.argv[2] or sys.argv[2].startswith("-"):
