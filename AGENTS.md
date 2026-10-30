@@ -46,3 +46,9 @@ format. Before hardware release, agree endianness, empty files, retry bounds,
 timeouts, partial-file policy and what the LED means. Never report ACK from the
 radio as proof that a remote file was saved. Retry budget: two repair cycles,
 then stop and report unresolved failures. Do not weaken checks.
+
+## Confirmed radio selection
+Owner specifies 2.4 GHz band, RF channel 74 on TX and RX. Use 74, not the
+reference script's 76. On the nRF24L01 mapping this is 2474 MHz centre frequency
+(2400 + 74 MHz), not a Wi-Fi channel number. No tested driver, RF data rate,
+PA setting, address profile or exact module variant is implied. See hardware.md.
