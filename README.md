@@ -9,6 +9,9 @@ Separate from emergency-net. Bootstrap proposal, not hardware-ready firmware.
 python3 quick_mode.py example.txt --dry-run
 python3 harness.py check
 ```
+Host validation: 12 tests passed on CPython 3.9.25 and 3.10.12, x86_64.
+This does not validate the Pi ARM/32-bit runtime.
+
 The dry-run reads the explicitly named TXT as raw bytes, prepares a 4-byte count
 header and 32-byte chunks, reconstructs locally and prints JSON. It never sends
 radio packets, drives GPIO, downloads a URL or scans USB mounts.
@@ -24,7 +27,8 @@ coding workers or enforce GitHub branch protection. Protected-file changes must
 be owner-reviewed; CI does not authenticate human approval. No automatic merge.
 
 ## Pending decisions
-- Exact transceiver, radio driver, wiring and LED GPIO/resistor/polarity.
+- Exact nRF24L01-family module variant/driver, physical wiring verification
+  and LED GPIO/resistor/polarity. Intended SPI0/CE wiring is in hardware.md.
 - Does "download" mean URL to radio TX, USB/local TXT, or radio RX to file?
 - OS release/Python version on installed Raspberry Pi OS Lite 32-bit; real device testing and interoperability contract.
 - Protocol completion/integrity rules and actual LED semantics.
