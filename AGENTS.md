@@ -34,9 +34,9 @@ plan, battery protection/charging design, polarity and supply ratings first.
 No secrets in code, logs or PRs. No copied upstream code without license clearance.
 
 ## Hardware facts
-Owner confirmed Raspberry Pi Zero W V1.1 on 2026-10-30. Radio model, LED GPIO,
-polarity/resistor, SPI/CE/CSN wiring, Python version and intended TXT source remain
-unknown. Target OS: Raspberry Pi OS Lite, 32-bit (release not supplied). See hardware.md. Keep real hardware adapters disabled until resolved.
+Owner confirmed Raspberry Pi Zero W V1.1 on 2026-10-30. Schematic indicates an nRF24L01-family target and SPI0 with CE=BCM25, CSN=BCM8.
+Exact radio variant, LED GPIO/polarity/resistor, Python version and TXT source
+remain unknown. Wiring is intended, not physically tested. Target OS: Raspberry Pi OS Lite, 32-bit (release not supplied). See hardware.md. Never reuse reference CE=22 for diagram BCM25. Keep real hardware adapters disabled until resolved.
 
 ## First feature boundary
 Reference quick mode sends a count header then <=32-byte chunks. It is not an
