@@ -14,7 +14,60 @@ import tempfile
 import time
 
 from transfer import (MAX_BYTES, TOTAL_TIMEOUT, RECEIPT_LINGER,
-                      crc32, decode, encode, receive_v1, send_v1)
+                      crc32, decode, encode, receive_v1, send_v1,
+                      unpack_packet, expected_reply, START, DATA, FINISH)
+
+
+def console(message):
+    """Milestones go to stderr; stdout remains the final machine-readable JSON."""
+    print("[{:.3f}] {}".format(time.monotonic(), message), file=sys.stderr, flush=True)
+
+
+class LoggedTxRadio:
+    """Observe actual TX requests/replies without changing PT/1 or claiming RF proof."""
+    def __init__(self, radio, total, debug=False):
+        self.radio, self.total, self.debug = radio, total, debug
+        self.pending = None
+        self.attempts = 0
+        self.accepted_bytes = 0
+        self.next_progress = 0
+
+    def send(self, frame):
+        kind, session, sequence, body = unpack_packet(frame)
+        if self.pending == frame:
+            self.attempts += 1
+        else:
+            self.pending, self.attempts = frame, 1
+        if self.debug or self.attempts > 1 or kind in (START, FINISH):
+            console("TX {} seq={} attempt={} (link ACK is not file saved)".format(
+                {START: "START", DATA: "DATA", FINISH: "FINISH"}[kind],
+                sequence, self.attempts))
+        ack = self.radio.send(frame)
+        if self.debug:
+            console("TX link ACK observed={}".format(bool(ack)))
+        return ack
+
+    def receive(self, timeout):
+        frame = self.radio.receive(timeout)
+        if frame is None:
+            if self.debug:
+                console("TX reply wait expired; no matching receipt yet")
+        elif self.pending is not None and frame == expected_reply(self.pending):
+            kind, session, sequence, body = unpack_packet(self.pending)
+            if kind == DATA:
+                self.accepted_bytes = min(self.total, sequence * 16)
+                percent = (100 * self.accepted_bytes // self.total) if self.total else 100
+                if self.debug or percent >= self.next_progress:
+                    console("TX peer accepted data {}/{} bytes ({}%); NOT saved yet".format(
+                        self.accepted_bytes, self.total, percent))
+                    self.next_progress = (percent // 10 + 1) * 10
+            elif kind == FINISH:
+                console("TX matching remote SAVED receipt observed; awaiting normal cleanup")
+            elif self.debug:
+                console("TX matching START ACK observed")
+        elif self.debug:
+            console("TX unrelated reply ignored by protocol")
+        return frame
 
 
 def read_txt(path):
@@ -140,6 +193,7 @@ class ButtonLed:
                 self._call(self.pi.set_mode, pin, pigpio.OUTPUT)
             self._call(self.pi.set_mode, self.BUTTON, pigpio.INPUT)
             self._call(self.pi.set_pull_up_down, self.BUTTON, pigpio.PUD_UP)
+            console("Button/RGB ready: common GND; LED off; local pigpiod")
             return self
         except BaseException:
             self.close()
@@ -152,6 +206,10 @@ class ButtonLed:
         for pin, active in zip(self.PINS, value):
             if active:
                 self._call(self.pi.write, pin, 1)
+        console("LED command completed: {} (physical light not sensed)".format(
+            {(0, 0, 0): "off", (0, 0, 1): "blue / attempting TX",
+             (0, 1, 0): "green / saved receipt confirmed",
+             (1, 0, 0): "red / attempt unconfirmed"}.get(value, "custom")))
 
     def _stable(self, level):
         since = None
@@ -173,8 +231,11 @@ class ButtonLed:
         print("Release button, then press and release to send once; Ctrl-C cancels.",
               file=sys.stderr, flush=True)
         # A button held at startup must be released before arming a new press.
-        for level in (1, 0, 1):
+        for level, message in ((1, "Button armed: released"),
+                               (0, "Button press stable; waiting for release"),
+                               (1, "Button release stable; starting one TX")):
             self._stable(level)
+            console(message)
 
     def result(self, saved):
         try:
@@ -218,6 +279,8 @@ def radio_main(argv):
                         help="attest reviewed module, power, wiring and antenna checks")
     parser.add_argument("--button-led", action="store_true",
                         help="TX only: common-GND RGB, press/release once to send")
+    parser.add_argument("--debug", action="store_true",
+                        help="TX: log every request/link ACK/reply; never file contents")
     args = parser.parse_args(argv)
     if args.button_led and args.role != "tx":
         parser.error("--button-led is TX only; RX still starts immediately")
@@ -225,6 +288,11 @@ def radio_main(argv):
         # Validate paths/data before any driver import or GPIO/device access.
         content = read_txt(args.file) if args.role == "tx" else None
         output = CompletedFile(args.file) if args.role == "rx" else None
+        if args.role == "tx":
+            console("TXT loaded: {} ({} bytes; snapshot held in memory)".format(
+                args.file, len(content)))
+        else:
+            console("RX destination checked: {} (must not exist)".format(args.file))
         from radio_adapter import open_radio
 
         with exclusive_radio(), (ButtonLed() if args.button_led else nullcontext()) as ui:
@@ -240,6 +308,8 @@ def radio_main(argv):
             if ui is not None:
                 ui.result(True)
         report.update({"channel": 74, "rate": args.rate, "pa": "MIN"})
+        console("{} complete: {}".format(args.role.upper(),
+                "remote SAVED confirmed" if args.role == "tx" else "local file saved"))
         print(json.dumps(report))
         return 0
     except KeyboardInterrupt:
@@ -254,17 +324,25 @@ def radio_main(argv):
 def perform_transfer(args, content, output, open_radio, ui):
     if ui is not None:
         ui.color((0, 0, 1))
+    console("Opening {} radio: channel74 rate={} PA=MIN".format(args.role.upper(), args.rate))
     if args.role == "tx":
         session = int.from_bytes(os.urandom(8), "big") or 1
         with open_radio(args.role, args.rate, args.hardware_checked) as radio:
-            frames = send_v1(content, session, args.rate, radio, time.monotonic)
+            console("TX radio ready; beginning START/data/FINISH ({} data blocks)".format(
+                (len(content) + 15) // 16))
+            observed = LoggedTxRadio(radio, len(content), args.debug)
+            frames = send_v1(content, session, args.rate, observed, time.monotonic)
         report = {"mode": "tx", "protocol": "PT/1", "bytes": len(content),
                   "frames": frames, "remote_saved_receipt": True,
                   "crc32": "{:08x}".format(crc32(content))}
     else:
         with output:
             with open_radio(args.role, args.rate, args.hardware_checked) as radio:
-                count = receive_v1(args.rate, radio, output.save, time.monotonic)
+                console("RX radio ready; waiting for START (30s); RX also transmits replies")
+                def save_and_log(data):
+                    output.save(data)
+                    console("RX TXT saved atomically: {} bytes; sending SAVED reply".format(len(data)))
+                count = receive_v1(args.rate, radio, save_and_log, time.monotonic)
         report = {"mode": "rx", "protocol": "PT/1", "bytes": count,
                   "local_file_saved": True, "output": str(args.file)}
     return report
