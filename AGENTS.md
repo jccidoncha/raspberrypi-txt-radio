@@ -35,8 +35,8 @@ No secrets in code, logs or PRs. No copied upstream code without license clearan
 
 ## Hardware facts
 Owner confirmed Raspberry Pi Zero W V1.1 on 2026-10-30. Radio model, LED GPIO,
-polarity/resistor, SPI/CE/CSN wiring, OS/Python and intended TXT source remain
-unknown. See hardware.md. Keep real hardware adapters disabled until resolved.
+polarity/resistor, SPI/CE/CSN wiring, Python version and intended TXT source remain
+unknown. Target OS: Raspberry Pi OS Lite, 32-bit (release not supplied). See hardware.md. Keep real hardware adapters disabled until resolved.
 
 ## First feature boundary
 Reference quick mode sends a count header then <=32-byte chunks. It is not an
