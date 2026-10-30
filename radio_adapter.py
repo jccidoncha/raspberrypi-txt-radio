@@ -5,7 +5,9 @@ Private register access is isolated here because two release helpers are faulty;
 see reference.md. No source from either unlicensed reference is incorporated.
 """
 import importlib
+from contextlib import contextmanager
 from importlib import metadata
+import socket
 import time
 
 from transfer import RATE_CODES
@@ -15,6 +17,46 @@ CHANNEL = 74
 REQUEST_ADDRESS = b"PTX01"
 REPLY_ADDRESS = b"PRX01"
 SEND_TIMEOUT = 0.1
+CLEANUP_TIMEOUT = 0.2
+IO_TIMEOUT = 1.0
+
+
+class _DeadlineExpired(TimeoutError):
+    """An operation budget expired between completed daemon commands."""
+
+
+class _DeadlineSocket:
+    """Apply the remaining budget to *each* send/recv in pigpio's SPI calls."""
+
+    def __init__(self, raw, io):
+        self.raw, self.io = raw, io
+
+    def __getattr__(self, name):
+        return getattr(self.raw, name)
+
+    def _call(self, name, *args):
+        try:
+            self.raw.settimeout(self.io.remaining())
+            result = getattr(self.raw, name)(*args)
+            self.io.check()
+            return result
+        except OSError:
+            # A partial command/reply cannot safely be followed by another command.
+            self.io.broken = True
+            raise
+
+    def send(self, *args):
+        return self._call("send", *args)
+
+    def sendall(self, *args):
+        return self._call("sendall", *args)
+
+    def recv(self, *args):
+        result = self._call("recv", *args)
+        if not result:
+            self.io.broken = True
+            raise OSError("pigpio command connection closed")
+        return result
 
 
 class _PiIO:
@@ -24,28 +66,90 @@ class _PiIO:
         self.pi = pi
         self.enabled = False
         self.handles = []
+        self.deadline = None
+        self.broken = False
+        pi.sl.s = _DeadlineSocket(pi.sl.s, self)
+
+    def check(self):
+        if self.broken:
+            raise OSError("pigpio command stream failed; reopen radio")
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise _DeadlineExpired("radio I/O deadline expired")
+
+    def remaining(self):
+        self.check()
+        if self.deadline is None:
+            return IO_TIMEOUT
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise _DeadlineExpired("radio I/O deadline expired")
+        return min(IO_TIMEOUT, remaining)
+
+    @contextmanager
+    def budget(self, timeout):
+        previous = self.deadline
+        self.deadline = time.monotonic() + max(0, timeout)
+        try:
+            yield
+            self.check()
+        finally:
+            self.deadline = previous
+
+    def call(self, action, *args):
+        self.pi.sl.s.settimeout(self.remaining())
+        result = action(*args)
+        self.check()
+        return result
+
+    def sleep(self, seconds):
+        time.sleep(min(seconds, self.remaining()))
+        self.check()
+
+    def disconnect(self):
+        # pigpio.stop() normally sends on its separate notification socket without
+        # a timeout. No callbacks are used here: shut that socket locally instead.
+        notify = getattr(self.pi, "_notify", None)
+        try:
+            if notify is not None:
+                notify.go = False
+                self.pi._notify = None
+                try:
+                    notify.sl.s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                finally:
+                    notify.sl.s.close()
+        finally:
+            self.pi.stop()  # Only local command-socket close remains in 1.78.
 
     def set_mode(self, pin, mode):
         if pin != CE:
             raise ValueError("unapproved GPIO")
-        return self.pi.set_mode(pin, mode)
+        if mode == 1:  # OUTPUT: clear a retained high latch before changing mode.
+            self.write(CE, 0)
+        return self.call(self.pi.set_mode, pin, mode)
 
     def write(self, pin, value):
         if pin != CE:
             raise ValueError("unapproved GPIO")
-        return self.pi.write(pin, value if self.enabled else 0)
+        result = self.call(self.pi.write, pin, value if self.enabled else 0)
+        if result is not None and result < 0:
+            raise OSError("CE write failed")
+        return result
 
     def spi_open(self, channel, speed):
         if channel != 0 or speed != 1000000:
             raise ValueError("unapproved SPI profile")
+        self.pi.sl.s.settimeout(self.remaining())
         handle = self.pi.spi_open(channel, speed)
         if handle < 0:
             raise OSError("SPI0 CE0 open failed")
         self.handles.append(handle)
+        self.check()
         return handle
 
     def spi_xfer(self, handle, data):
-        count, received = self.pi.spi_xfer(handle, data)
+        count, received = self.call(self.pi.spi_xfer, handle, data)
         if count != len(data) or len(received) != len(data):
             raise OSError("short SPI transaction")
         return count, received
@@ -58,6 +162,8 @@ class NrfRadio:
         self.driver = None
         self.closed = False
         try:
+            # pigpio.write sets the latch before OUTPUT; set_mode alone does not.
+            self.io.write(CE, 0)
             selected_rate = (module.RF24_DATA_RATE.RATE_250KBPS if rate == "250k"
                              else module.RF24_DATA_RATE.RATE_2MBPS)
             self.driver = module.NRF24(
@@ -80,8 +186,10 @@ class NrfRadio:
             expected = {0x00: 0x0c, 0x01: 3, 0x02: 3, 0x03: 3,
                         0x04: 0x52, 0x05: CHANNEL, 0x06: rf_setup,
                         0x11: 32, 0x12: 32, 0x1c: 0, 0x1d: 0}
-            if any(self._read_register(reg) != value for reg, value in expected.items()):
-                raise OSError("radio profile readback mismatch; check wiring/module")
+            for reg, value in expected.items():
+                mask = 0xfe if reg == 0x06 else 0xff  # RF_SETUP bit 0 is obsolete.
+                if (self._read_register(reg) & mask) != (value & mask):
+                    raise OSError("radio profile readback mismatch; check wiring/module")
             if (nrf.get_writing_address() != writing
                     or nrf.get_reading_address(1) != reading):
                 raise OSError("radio address readback mismatch")
@@ -107,33 +215,68 @@ class NrfRadio:
     def send(self, frame):
         if len(frame) != 32:
             raise ValueError("radio requires a fixed 32-byte PT/1 packet")
-        # Give the peer time to return to PRX before application replies.
-        time.sleep(0.005)
         nrf = self.driver
         try:
-            nrf.flush_tx()
-            nrf.send(frame)
-            deadline = time.monotonic() + SEND_TIMEOUT
-            while time.monotonic() < deadline:
-                status = nrf.get_status()
-                if status & 0x10:  # MAX_RT takes precedence over TX_DS.
-                    return False
-                if status & 0x20:
-                    return True
-                time.sleep(0.001)
+            with self.io.budget(SEND_TIMEOUT):
+                # Peer settling, preparation, driver send and polling share a budget.
+                self.io.sleep(0.005)
+                nrf.flush_tx()
+                nrf.send(frame)
+                self.io.check()
+                while True:
+                    status = nrf.get_status()
+                    self.io.check()
+                    if status & 0x10:  # MAX_RT takes precedence over TX_DS.
+                        return False
+                    if status & 0x20:
+                        return True
+                    self.io.sleep(0.001)
+        except _DeadlineExpired:
             return False
         finally:
-            nrf.unset_ce()
-            nrf.flush_tx()
-            nrf.power_up_rx()
+            self._restore_rx()
+
+    def _restore_rx(self):
+        try:
+            with self.io.budget(CLEANUP_TIMEOUT):
+                self.driver.unset_ce()
+                self.driver.flush_tx()
+                self.driver.power_up_rx()
+        except BaseException as error:
+            # No second cleanup budget or commands on a possibly partial stream.
+            self.closed = True
+            self.io.enabled = False
+            self.io.broken = True
+            self.io.disconnect()
+            if isinstance(error, Exception):
+                raise OSError("radio recovery failed; inspect hardware state") from error
+            raise
 
     def receive(self, timeout):
-        deadline = time.monotonic() + max(0, timeout)
-        while time.monotonic() < deadline:
-            if self.driver.data_ready():
-                return bytes(self.driver.get_payload())
-            time.sleep(min(0.002, max(0, deadline - time.monotonic())))
-        return None
+        if timeout <= 0:
+            return None
+        recovering = False
+        try:
+            with self.io.budget(timeout):
+                while True:
+                    ready = self.driver.data_ready()
+                    self.io.check()
+                    if ready:
+                        recovering = True
+                        payload = bytes(self.driver.get_payload())
+                        self.io.check()
+                        recovering = False
+                        return payload
+                    self.io.sleep(0.002)
+        except _DeadlineExpired:
+            return None
+        except OSError:
+            recovering = False
+            self.close()
+            raise
+        finally:
+            if recovering:
+                self._restore_rx()
 
     def close(self):
         if self.closed:
@@ -141,17 +284,24 @@ class NrfRadio:
         self.closed = True
         self.io.enabled = False
         errors = []
-        actions = [lambda: self.pi.write(CE, 0)]
+        actions = [lambda: self.io.write(CE, 0)]
         if self.driver is not None:
             actions.append(self.driver.power_down)
-        actions.extend(lambda handle=handle: self.pi.spi_close(handle)
+        actions.extend(lambda handle=handle: self.io.call(self.pi.spi_close, handle)
                        for handle in self.io.handles)
-        actions.append(self.pi.stop)
-        for action in actions:
-            try:
-                action()
-            except Exception as error:
-                errors.append(error)
+        try:
+            with self.io.budget(CLEANUP_TIMEOUT):
+                for action in actions:
+                    try:
+                        self.io.check()
+                        action()
+                    except Exception as error:
+                        errors.append(error)
+        except Exception as error:
+            errors.append(error)
+        finally:
+            self.io.broken = True
+            self.io.disconnect()
         if errors:
             raise OSError("radio cleanup failed; inspect hardware state") from errors[0]
 
@@ -182,9 +332,4 @@ def open_radio(role, rate, hardware_checked=False):
     if not pi.connected:
         pi.stop()
         raise OSError("local pigpiod unavailable at 127.0.0.1:8888")
-    try:
-        pi.sl.s.settimeout(1.0)  # Bound command I/O if the daemon stops responding.
-    except BaseException:
-        pi.stop()
-        raise
     return NrfRadio(pi, nrf24, role, rate)
