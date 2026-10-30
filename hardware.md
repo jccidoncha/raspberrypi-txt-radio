@@ -66,3 +66,14 @@ http://www.ams-semitech.com/attachments/File/AMS1117_20120314.pdf
 These chip sources do not certify the unidentified radio/regulator modules.
 The drawing omits battery, boost and charger connections, so those parts remain
 outside any reviewed power design. No instruction to power the build is given.
+
+## Owner-selected radio channel (2026-10-30)
+Owner specifies the 2.4 GHz band and channel 74 for both TX and RX. This
+supersedes reference quick_mode.py channel 76; do not carry 76 into a driver.
+For the Nordic nRF24L01 RF_CH mapping, F0 = 2400 + RF_CH MHz, so channel 74
+corresponds to a 2474 MHz centre frequency. This is a calculated chip setting,
+not a measured emission or a claim of tested RF performance/regulatory approval.
+Source: Nordic product specification linked above, RF channel frequency section.
+Data rate, PA level, addresses and exact module variant are not selected by
+this channel clarification. Both nodes must eventually use the same profile.
+No radio driver is enabled and no physical transmission has been attempted.
