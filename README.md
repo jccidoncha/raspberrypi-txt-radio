@@ -143,6 +143,22 @@ README/new test files. It is not weakened here: use `harness.py check`, inspect
 this explicitly scoped PR diff, and obtain owner review. Author tests are not
 independent review and this PR must not be automatically merged.
 
+### Console diagnostics
+
+Normal TX/RX logs go to stderr with monotonic seconds. They show TXT snapshot
+path/byte count, destination preflight, GPIO/button transitions, attempted LED
+commands (not sensed light), radio startup, coarse TX data-ACK progress, retries,
+and matching remote SAVED receipt. Data ACK progress is explicitly NOT proof
+of disk saving. RX reports atomic save before attempting its SAVED reply. Final
+stdout remains a single JSON result. No file contents are printed.
+
+Add `--debug` to a TX invocation for every packet type/sequence/attempt,
+observed link ACK and reply wait/acceptance. These are host-observed protocol
+calls, not measured on-air packets; a driver send may itself retry. Logging can
+slow large transfers, especially debug on a Pi; existing deadlines still apply.
+A printed SAVED observation is provisional until radio cleanup succeeds and
+final JSON is emitted. Red/errors mean unconfirmed, not guaranteed remote loss.
+
 ## PT/1 wire contract
 
 This is an original, explicitly different protocol, incompatible with both
