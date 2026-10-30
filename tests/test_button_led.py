@@ -203,6 +203,34 @@ import quick_mode
                 self.assertEqual(q.main([str(path),'--dry-run']),0)
                 gpio.assert_not_called()
 
+    def test_debug_logs_observed_retry_progress_and_saved_without_content(self):
+        import transfer as t
+        clock = Clock()
+        # Force a real first START retry with an observed lost reply.
+        radio = Exchange(clock, drop_replies=((0, 1),))
+        with redirect_stderr(io.StringIO()) as stderr:
+            count = t.send_v1(b'PRIVATE_TEXT', 9, '250k',
+                              q.LoggedTxRadio(radio, 12, True), clock.now)
+        log = stderr.getvalue()
+        self.assertEqual(count,3)
+        self.assertIn('attempt=2',log)
+        self.assertIn('peer accepted data',log)
+        self.assertIn('NOT saved yet',log)
+        self.assertIn('matching remote SAVED',log)
+        self.assertNotIn('PRIVATE_TEXT',log)
+
+    def test_no_saved_log_for_unrelated_receipt(self):
+        import transfer as t
+        radio = unittest.mock.MagicMock()
+        observed = q.LoggedTxRadio(radio,0,True)
+        request = next(t.v1_frames(b'',7,'250k'))
+        radio.receive.return_value = t.packet(t.SAVED,8,1)
+        with redirect_stderr(io.StringIO()) as stderr:
+            observed.send(request)
+            observed.receive(1)
+        self.assertNotIn('matching remote SAVED',stderr.getvalue())
+        self.assertIn('unrelated reply',stderr.getvalue())
+
 
 if __name__ == '__main__':
     unittest.main()
