@@ -23,10 +23,21 @@ with the original tests unchanged. It never opens hardware. It does **not**
 simulate PT/1 or establish interoperability with either reference. New host tests
 exercise PT/1, fake radio/SPI, filesystem and CLI behavior.
 
-Implementation validation on CPython 3.10.12: 43 host tests passed, including
-all 12 unchanged legacy tests. The actual nrf24 2.0.0 wheel also passed 12
-fake-SPI role/rate/status combinations. Whitespace checks passed. These are
-author checks, not independent review or Pi/radio measurements.
+Repair cycle 1 validation on CPython 3.10.12: 60 host tests passed (all 43 existing
+tests unchanged, plus 17 regressions). Offline probes using the hash-checked
+nrf24 2.0.0 and pigpio 1.78 wheels passed 21 tests, including retained-high CE
+latches, both RF_SETUP bit-0 values, nonzero I/O latency and bounded cleanup.
+See [reference.md](reference.md) for simulated timings and release evidence.
+These are author checks, not independent review or Pi/radio measurements.
+
+To repeat the release probes with those wheels already present locally:
+
+```sh
+python3 tests/probe_radio_release.py /explicit/local/wheel-directory
+```
+
+The runner checks the recorded SHA-256 digests and imports directly from the
+wheels. It performs no installation, network connection or device access.
 
 ## Controlled hardware use, only after review
 
@@ -63,8 +74,11 @@ python3 quick_mode.py tx /explicit/sd/folder/source.txt --rate 250k --hardware-c
 Both sides use channel 74, fixed 32-byte payloads, 5-byte addresses, 2-byte hardware
 CRC and chip PA `MIN`. These are proposed software settings except for the
 owner-selected channel and explicit rate choice. No MAX or carrier option exists.
-SPI0 CE0/BCM8, CE BCM25, 1 MHz SPI clock. Register/address readback must pass
-before CE can rise. A process lock prevents concurrent instances from using the
+SPI0 CE0/BCM8, CE BCM25, 1 MHz SPI clock. The adapter writes CE low before driver
+construction and before forwarding an output-mode change, clearing a retained
+high latch. Register/address readback must pass before an explicit CE-high write
+is allowed. RF_SETUP readback ignores only obsolete bit 0; rate, PA, carrier,
+PLL and reserved-bit checks remain. A process lock prevents concurrent instances from using the
 local radio; it does not coordinate unrelated radio software.
 
 Files are binary bytes regardless of encoding: empty files, embedded/trailing
@@ -122,13 +136,31 @@ identities. Start only one pair in the test area.
 
 Each request gets one initial attempt and at most two application repairs. Each
 radio send has two hardware retransmissions at 1500 us spacing, with a 100 ms
-adapter deadline. TX waits up to one second for an application reply per attempt.
+adapter deadline covering peer settling, preparation, send and status polling.
+Receive deadlines cover readiness checks and the complete payload read. Late
+status/payload results cannot report success. Each blocking command-socket send
+or receive uses the remaining operation budget (capped at one second), including
+each partial SPI reply read. TX waits up to one second for an application reply per attempt.
 RX waits 30 seconds for START, then 10 seconds without **new progress**. Each
 protocol invocation has a 300-second total deadline. RX remains for four seconds
 after saving to answer duplicate FINISH requests; duplicates do not extend this.
-Driver command socket I/O has a one-second timeout. A Linux CLI watchdog covers
-hardware startup/transfer/save for 319 seconds. Deadlines are best-effort under
-OS scheduling; uninterruptible OS I/O cannot be guaranteed.
+
+Returning to RX after send, or after an interrupted payload read, has a separate
+**200 ms total cleanup allowance**. Thus send may take up to 300 ms including
+recovery; receive may take its requested timeout plus 200 ms. Closing the radio
+also gets one shared 200 ms allowance for CE-low, power-down and SPI-handle
+closure, not 200 ms per action. Recovery failure disconnects locally without
+starting another cleanup budget. Notification sockets are shut down locally;
+cleanup does not send an unbounded notification-stop command.
+
+Expiry between complete commands returns `False` (send) or `None` (receive).
+A socket timeout/partial reply makes the connection unusable: stop and report
+an error instead of issuing further commands on that stream. Cleanup failure
+also reports an error. Disconnection cannot prove CE-low, radio power-down or
+daemon-side resource release; hardware state then requires inspection.
+Startup command-socket calls retain a one-second I/O cap. A Linux CLI watchdog
+covers hardware startup/transfer/save for 319 seconds. Deadlines are best-effort
+under OS scheduling; uninterruptible OS I/O cannot be guaranteed.
 
 Incomplete content stays in bounded memory. An empty hidden `.pi-txt-*.partial`
 file is reserved in the destination directory before opening hardware. On FINISH,
@@ -156,7 +188,9 @@ hardware effects.
 The owner scoped tests and hardware/reference/agent documentation for this feature.
 `policy.json` still only allows `transfer.py` and `quick_mode.py` as candidates,
 so `harness.py candidate BASE_SHA` rejects this broader diff. Policy/harness/CI
-are unchanged. Eight files are changed, but protected paths and the scope gap
-still need owner review. Candidate checks omit untracked files; review the two
-new files explicitly. Passing host tests is not independent review. No reference
+are unchanged. Protected paths and the scope gap still need owner review.
+Candidate checks omit untracked files; review the adapter, radio tests and release
+probe runner explicitly. The three independent findings are addressed by this
+local repair; these author checks do not constitute another independent review.
+No further audit round is performed. No reference
 material or preliminary notes belong in a commit. No push or merge.
