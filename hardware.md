@@ -77,3 +77,10 @@ Source: Nordic product specification linked above, RF channel frequency section.
 Data rate, PA level, addresses and exact module variant are not selected by
 this channel clarification. Both nodes must eventually use the same profile.
 No radio driver is enabled and no physical transmission has been attempted.
+
+## TXT source clarified (2026-10-30)
+Owner specifies a folder on the Raspberry Pi SD card. The exact path is not
+fixed: pass the local `.txt` path explicitly to the CLI. No URL download or
+automatic USB discovery is required. RX save directory and overwrite behavior
+are not established by this source selection. Real radio transfer is pending
+a confirmed module/driver and paired hardware tests.
