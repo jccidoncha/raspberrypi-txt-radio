@@ -13,9 +13,12 @@ These are listing descriptions, not verified electrical ratings or an approved
 power circuit. The PDF does not identify the Pi or transceiver.
 
 ## Must resolve before hardware adapters
+Installed OS: Raspberry Pi OS Lite, 32-bit, as reported by owner. Release and
+Python version not supplied; host CI is not a 32-bit board test.
+
 Radio exact model and driver/license; SPI device and CE/CSN; LED BCM pin,
 polarity and resistor; power schematic, ground, battery topology/protection,
-charger behavior and regulator ratings; OS and Python version.
+charger behavior and regulator ratings; OS release and Python version.
 Do not wire either cells or converters from this list alone.
 No driver is installed automatically. CI runs on a host and does not prove this
 board can run a selected GPIO library. Pi/OS bring-up and paired radio testing
