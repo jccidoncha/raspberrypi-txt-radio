@@ -1,0 +1,8 @@
+{
+  "candidate_files": ["transfer.py", "quick_mode.py"],
+  "protected": ["AGENTS.md", "tests/", "harness.py", "policy.json", ".github/", "hardware.md", "reference.md"],
+  "max_changed_files": 8,
+  "max_patch_bytes": 100000,
+  "max_repair_cycles": 2,
+  "no_merge": true
+}
