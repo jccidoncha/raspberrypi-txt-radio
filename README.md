@@ -2,6 +2,8 @@
 
 University project: two Raspberry Pi Zero W V1.1 units (TX and RX),
 with transceivers and GPIO LEDs.
+Owner-selected radio profile: 2.4 GHz band, channel 74 for TX and RX.
+On the nRF24L01 RF_CH mapping this is 2474 MHz; no radio driver is enabled.
 Separate from emergency-net. Bootstrap proposal, not hardware-ready firmware.
 
 ## Run locally (Python 3.9+ standard library)
