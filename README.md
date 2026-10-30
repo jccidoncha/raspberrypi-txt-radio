@@ -4,7 +4,7 @@ Original PT/1 software for two Raspberry Pi Zero W V1.1 units running Raspberry
 Pi OS Lite 32-bit. Install the **same program on both**; select `tx` or `rx` per
 invocation, then swap roles on a later invocation. This is one controlled
 transfer at a time. No simultaneous duplex, discovery, relay, USB scanning,
-HTTP download, LED control or button action is implemented.
+or HTTP download is implemented. Optional TX button/RGB control is described below.
 
 No physical hardware was available. Host tests do not establish ARM compatibility,
 radio delivery, electrical safety or regulatory compliance. Read
@@ -92,6 +92,72 @@ saving after validation and publication. Hardware ACK alone proves neither.
 If all saved-file receipts are lost, TX fails as **unconfirmed** even though RX
 may have a complete file. Inspect it before retrying with a new output path.
 Re-running RX against an existing destination fails; nothing is overwritten.
+
+## Optional TX button and RGB (review proposal)
+
+The common RGB connection is GND, as confirmed by the owner. Intended BCM pins
+match `rgb_test.py`: red17/green27/blue22, each with its own 330 ohm resistor;
+button23 to GND with internal pull-up. Verify physical wiring first. This mode
+is common-cathode only, not an automatic polarity detector. Radio CE remains25,
+not22. `rgb_test.py` stays an unchanged standalone light test; do not run it
+alongside this mode or import it. No gpiozero dependency is added to quick mode.
+
+```sh
+# TX only, after reviewing both radio AND button/RGB wiring:
+python3 quick_mode.py tx /explicit/sd/folder/source.txt --rate 250k --hardware-checked --button-led
+```
+
+With no `--button-led`, existing TX/RX and dry-run behavior remain unchanged.
+The optional mode validates and reads a snapshot of that TXT before opening GPIO.
+It connects only to local pigpiod using the existing pigpio1.78 dependency. It
+holds the same process lock while waiting. Release any initially held button,
+then press and release; each level must stay stable for50ms (polled every10ms).
+The wait has no timer; Ctrl-C cancels without opening the radio. The radio opens
+only after release, and the existing transfer deadline starts then. Start RX
+just before pressing TX: RX's existing30-second initial wait does not change.
+
+One invocation sends once and exits. To send again, start a new RX with a new
+output filename and rerun TX. Changes to the source while waiting are not sent;
+cancel/restart to read a new snapshot. It never invents a file path or overwrites
+an RX file, repeats automatically, changes role, or runs the30-second RGB test.
+
+Proposed status colors for owner review: off while waiting, blue while attempting
+TX, green only after matching remote SAVED receipt and normal radio cleanup,
+red if the attempt fails or is unconfirmed. Green/red display for two seconds,
+then outputs are turned off and the process exits. Red is NOT proof that RX did
+not save: inspect the completed RX file before retrying. LED indication errors
+are reported separately and never create a transfer-success receipt. Ctrl-C
+while waiting simply closes GPIO; interruption during an attempt is unconfirmed.
+
+GPIO startup/commands/cleanup use the existing bounded pigpio I/O machinery.
+Cleanup attempts to turn all channels off and disconnects on errors. A broken
+daemon connection can prevent verified LED-off; software cannot guarantee the
+physical output state after connection loss or power failure. No actual GPIO,
+Pi, switch, polarity, LED colors or RF behavior has been tested here. The pinned
+native daemon/ARMv6 caveats above still apply. Existing installation PDF/File
+predates this integration and is not an RGB installation guide.
+
+The new tests use fake GPIO, clock and radio; all60 prior tests stay unchanged.
+The repository's narrow `harness.py candidate BASE` allowlist still excludes
+README/new test files. It is not weakened here: use `harness.py check`, inspect
+this explicitly scoped PR diff, and obtain owner review. Author tests are not
+independent review and this PR must not be automatically merged.
+
+### Console diagnostics
+
+Normal TX/RX logs go to stderr with monotonic seconds. They show TXT snapshot
+path/byte count, destination preflight, GPIO/button transitions, attempted LED
+commands (not sensed light), radio startup, coarse TX data-ACK progress, retries,
+and matching remote SAVED receipt. Data ACK progress is explicitly NOT proof
+of disk saving. RX reports atomic save before attempting its SAVED reply. Final
+stdout remains a single JSON result. No file contents are printed.
+
+Add `--debug` to a TX invocation for every packet type/sequence/attempt,
+observed link ACK and reply wait/acceptance. These are host-observed protocol
+calls, not measured on-air packets; a driver send may itself retry. Logging can
+slow large transfers, especially debug on a Pi; existing deadlines still apply.
+A printed SAVED observation is provisional until radio cleanup succeeds and
+final JSON is emitted. Red/errors mean unconfirmed, not guaranteed remote loss.
 
 ## PT/1 wire contract
 
