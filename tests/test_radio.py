@@ -567,12 +567,12 @@ class AdapterTests(unittest.TestCase):
         raise OSError("initialization failed")
 
     def test_optin_profile_and_dependency_validation_before_import(self):
-        with patch("radio_adapter.importlib.import_module") as importing:
+        with patch.object(adapter.importlib, "import_module") as importing:
             for role, rate, checked in (("tx", "250k", False), ("rx", None, True),
                                         ("carrier", "2m", True)):
                 with self.assertRaises(ValueError):
                     adapter.open_radio(role, rate, checked)
-            with patch("radio_adapter.metadata.version", return_value="wrong"):
+            with patch.object(adapter.metadata, "version", return_value="wrong"):
                 with self.assertRaises(RuntimeError):
                     adapter.open_radio("tx", "2m", True)
             importing.assert_not_called()
@@ -582,10 +582,10 @@ class AdapterTests(unittest.TestCase):
         factory = unittest.mock.Mock(return_value=pi)
         modules = {"pigpio": SimpleNamespace(pi=factory), "nrf24": FAKE_MODULE}
         with patch.dict(os.environ, {"PIGPIO_ADDR": "remote", "PIGPIO_PORT": "9999"}), \
-                patch("radio_adapter.metadata.version", side_effect=lambda n: {
+                patch.object(adapter.metadata, "version", side_effect=lambda n: {
                     "nrf24": "2.0.0", "pigpio": "1.78"}[n]), \
-                patch("radio_adapter.importlib.import_module", side_effect=modules.get), \
-                patch("radio_adapter.time.sleep"):
+                patch.object(adapter.importlib, "import_module", side_effect=modules.get), \
+                patch.object(adapter.time, "sleep"):
             with adapter.open_radio("rx", "2m", True):
                 pass
         factory.assert_called_once_with("127.0.0.1", 8888, show_errors=False)
