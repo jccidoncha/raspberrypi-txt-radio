@@ -93,8 +93,8 @@ radio_adapter.NrfRadio.send = _reliable_send
 radio_adapter.NrfRadio.receive = _reliable_receive
 
 from transfer import (MAX_BYTES, RECEIPT_LINGER,
-                      crc32, decode, encode, receive_v1, send_v1,
-                      unpack_packet, expected_reply, START, DATA, FINISH)
+                     crc32, decode, encode, receive_v1, send_v1,
+                     unpack_packet, expected_reply, START, DATA, FINISH)
 
 BATCH_MAGIC = b"PT1DIR\x00\n"
 COMPRESS_MAGIC = b"PT1Z\x00\n"
@@ -481,8 +481,8 @@ class ButtonLed:
             self._set_raw_rgb(blink_rgb)
 
         for target_level, message in ((1, "Button armed: released"),
-                                      (0, "Button press stable; waiting for release"),
-                                      (1, "Button release stable")):
+                                     (0, "Button press stable; waiting for release"),
+                                     (1, "Button release stable")):
             since = None
             while True:
                 now = time.monotonic()
