@@ -1,38 +1,38 @@
-"""Original byte protocols and use cases; all effects are injected ports.
-
-encode/decode/transmit remain the legacy host-only count/chunk proposal.
-The explicitly separate PT/1 protocol is used for the controlled radio demo.
-"""
+"""Pure framing and PT/1 transfer core: struct and typing only."""
 import struct
-from typing import Callable, Iterable, Optional, Protocol
+from typing import Callable, Iterable, List, Optional, Protocol
 
-CHUNK_BYTES = 32
 MAX_BYTES = 1024 * 1024
+CHUNK_BYTES = 32
 
 
-class TransferError(RuntimeError):
-    """The transfer failed; delivery must not be reported as successful."""
+class TransferError(ValueError):
+    """Framing or protocol error."""
 
 
 class Radio(Protocol):
     def send(self, frame: bytes) -> bool:
-        """Return a link ACK, not an application delivery receipt."""
+        """Send one frame; return True on link ACK."""
 
 
 class Indicator(Protocol):
     def set_active(self, active: bool) -> None:
-        """Show transfer activity; pin configuration belongs to an adapter."""
+        """Set activity indicator state."""
 
 
-def encode(content: bytes) -> tuple[bytes, ...]:
+def encode(content: bytes) -> List[bytes]:
+    """Encode <=1 MiB into a 4-byte little-endian count header plus 32-byte chunks."""
     if len(content) > MAX_BYTES:
-        raise ValueError("file exceeds 1 MiB host-proposal limit")
-    chunks = tuple(content[i:i + CHUNK_BYTES]
-                   for i in range(0, len(content), CHUNK_BYTES))
-    return (struct.pack("<i", len(chunks)),) + chunks
+        raise ValueError("content exceeds 1 MiB limit")
+    count = (len(content) + CHUNK_BYTES - 1) // CHUNK_BYTES
+    frames = [struct.pack("<i", count)]
+    for offset in range(0, len(content), CHUNK_BYTES):
+        frames.append(content[offset:offset + CHUNK_BYTES])
+    return frames
 
 
 def decode(frames: Iterable[bytes]) -> bytes:
+    """Validate and reconstruct bytes from encode() frames."""
     iterator = iter(frames)
     header = next(iterator, b"")
     if len(header) != 4:

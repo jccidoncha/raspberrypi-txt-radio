@@ -16,8 +16,8 @@ CE = 25
 CHANNEL = 74
 REQUEST_ADDRESS = b"PTX01"
 REPLY_ADDRESS = b"PRX01"
-SEND_TIMEOUT = 0.1
-CLEANUP_TIMEOUT = 0.2
+SEND_TIMEOUT = 0.35
+CLEANUP_TIMEOUT = 0.50
 IO_TIMEOUT = 1.0
 
 
@@ -36,10 +36,8 @@ class _DeadlineSocket:
 
     def _call(self, name, *args):
         try:
-            self.raw.settimeout(self.io.remaining())
-            result = getattr(self.raw, name)(*args)
-            self.io.check()
-            return result
+            self.raw.settimeout(IO_TIMEOUT)
+            return getattr(self.raw, name)(*args)
         except OSError:
             # A partial command/reply cannot safely be followed by another command.
             self.io.broken = True
@@ -219,7 +217,7 @@ class NrfRadio:
         try:
             with self.io.budget(SEND_TIMEOUT):
                 # Peer settling, preparation, driver send and polling share a budget.
-                self.io.sleep(0.005)
+                self.io.sleep(0.003)
                 nrf.flush_tx()
                 nrf.send(frame)
                 self.io.check()
@@ -230,7 +228,7 @@ class NrfRadio:
                         return False
                     if status & 0x20:
                         return True
-                    self.io.sleep(0.001)
+                    self.io.sleep(0.0005)
         except _DeadlineExpired:
             return False
         finally:
@@ -260,14 +258,13 @@ class NrfRadio:
             with self.io.budget(timeout):
                 while True:
                     ready = self.driver.data_ready()
-                    self.io.check()
                     if ready:
                         recovering = True
                         payload = bytes(self.driver.get_payload())
-                        self.io.check()
                         recovering = False
                         return payload
-                    self.io.sleep(0.002)
+                    self.io.check()
+                    self.io.sleep(0.001)
         except _DeadlineExpired:
             return None
         except OSError:
