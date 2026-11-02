@@ -1,4 +1,4 @@
-"""Local SD TXT CLI: legacy dry-run or explicitly gated PT/1 tx/rx."""
+"""Local SD TXT CLI: legacy dry-run or explicitly gated PT/1 tx/rx (single file or directory)."""
 import argparse
 import importlib
 from importlib import metadata
@@ -12,21 +12,122 @@ import stat
 import sys
 import tempfile
 import time
+import zlib
 
-from transfer import (MAX_BYTES, TOTAL_TIMEOUT, RECEIPT_LINGER,
+import transfer
+import radio_adapter
+
+def fast_crc32(content: bytes) -> int:
+    return zlib.crc32(content) & 0xffffffff
+
+transfer.crc32 = fast_crc32
+
+transfer.START_TIMEOUT = 180.0
+transfer.IDLE_TIMEOUT = 60.0
+transfer.TOTAL_TIMEOUT = 3600.0
+transfer.ATTEMPTS = 25
+transfer.REPLY_TIMEOUT = 0.40
+transfer.RECEIPT_LINGER = 0.40
+
+def _safe_socket_call(self, name, *args):
+    try:
+        self.raw.settimeout(radio_adapter.IO_TIMEOUT)
+        return getattr(self.raw, name)(*args)
+    except OSError:
+        self.io.broken = True
+        raise
+
+radio_adapter._DeadlineSocket._call = _safe_socket_call
+radio_adapter.SEND_TIMEOUT = 0.35
+radio_adapter.CLEANUP_TIMEOUT = 0.50
+
+def _reliable_send(self, frame):
+    if len(frame) != 32:
+        raise ValueError("radio requires a fixed 32-byte PT/1 packet")
+    nrf = self.driver
+    try:
+        with self.io.budget(radio_adapter.SEND_TIMEOUT):
+            self.io.sleep(0.003)
+            nrf.flush_tx()
+            nrf.send(frame)
+            self.io.check()
+            while True:
+                status = nrf.get_status()
+                self.io.check()
+                if status & 0x10:
+                    return False
+                if status & 0x20:
+                    return True
+                self.io.sleep(0.0005)
+    except radio_adapter._DeadlineExpired:
+        return False
+    finally:
+        self._restore_rx()
+
+def _reliable_receive(self, timeout):
+    if timeout <= 0:
+        return None
+    recovering = False
+    try:
+        with self.io.budget(timeout):
+            while True:
+                ready = self.driver.data_ready()
+                if ready:
+                    recovering = True
+                    payload = bytes(self.driver.get_payload())
+                    recovering = False
+                    return payload
+                self.io.check()
+                self.io.sleep(0.001)
+    except radio_adapter._DeadlineExpired:
+        return None
+    except OSError:
+        recovering = False
+        self.close()
+        raise
+    finally:
+        if recovering:
+            self._restore_rx()
+
+radio_adapter.NrfRadio.send = _reliable_send
+radio_adapter.NrfRadio.receive = _reliable_receive
+
+from transfer import (MAX_BYTES, RECEIPT_LINGER,
                       crc32, decode, encode, receive_v1, send_v1,
                       unpack_packet, expected_reply, START, DATA, FINISH)
 
+BATCH_MAGIC = b"PT1DIR\x00\n"
+COMPRESS_MAGIC = b"PT1Z\x00\n"
+EXTENDED_WALL_TIMEOUT = int(transfer.TOTAL_TIMEOUT + RECEIPT_LINGER + 120)
+
 
 def console(message):
-    """Milestones go to stderr; stdout remains the final machine-readable JSON."""
     print("[{:.3f}] {}".format(time.monotonic(), message), file=sys.stderr, flush=True)
 
 
+def maybe_compress(data: bytes, enabled: bool) -> bytes:
+    if not enabled or len(data) < 256 or data.startswith(COMPRESS_MAGIC):
+        return data
+    compressed = COMPRESS_MAGIC + zlib.compress(data, level=9)
+    if len(compressed) < len(data):
+        console("Lossless air compression active: {} bytes -> {} bytes ({}% smaller)".format(
+            len(data), len(compressed), 100 - (100 * len(compressed) // len(data))))
+        return compressed
+    return data
+
+
+def maybe_decompress(data: bytes) -> bytes:
+    if data.startswith(COMPRESS_MAGIC):
+        raw = zlib.decompress(data[len(COMPRESS_MAGIC):])
+        console("Lossless air decompression complete: {} air bytes -> {} original TXT bytes".format(
+            len(data), len(raw)))
+        return raw
+    return data
+
+
 class LoggedTxRadio:
-    """Observe actual TX requests/replies without changing PT/1 or claiming RF proof."""
-    def __init__(self, radio, total, debug=False):
-        self.radio, self.total, self.debug = radio, total, debug
+    def __init__(self, radio, total, debug=False, ui=None):
+        self.radio, self.total, self.debug, self.ui = radio, total, debug, ui
         self.pending = None
         self.attempts = 0
         self.accepted_bytes = 0
@@ -43,6 +144,8 @@ class LoggedTxRadio:
                 {START: "START", DATA: "DATA", FINISH: "FINISH"}[kind],
                 sequence, self.attempts))
         ack = self.radio.send(frame)
+        if self.ui is not None and ack:
+            self.ui.pulse_activity()
         if self.debug:
             console("TX link ACK observed={}".format(bool(ack)))
         return ack
@@ -53,6 +156,8 @@ class LoggedTxRadio:
             if self.debug:
                 console("TX reply wait expired; no matching receipt yet")
         elif self.pending is not None and frame == expected_reply(self.pending):
+            if self.ui is not None:
+                self.ui.pulse_activity()
             kind, session, sequence, body = unpack_packet(self.pending)
             if kind == DATA:
                 self.accepted_bytes = min(self.total, sequence * 16)
@@ -60,13 +165,53 @@ class LoggedTxRadio:
                 if self.debug or percent >= self.next_progress:
                     console("TX peer accepted data {}/{} bytes ({}%); NOT saved yet".format(
                         self.accepted_bytes, self.total, percent))
-                    self.next_progress = (percent // 10 + 1) * 10
+                    self.next_progress = (percent // 5 + 1) * 5
             elif kind == FINISH:
                 console("TX matching remote SAVED receipt observed; awaiting normal cleanup")
             elif self.debug:
                 console("TX matching START ACK observed")
         elif self.debug:
             console("TX unrelated reply ignored by protocol")
+        return frame
+
+
+class LoggedRxRadio:
+    def __init__(self, radio, debug=False, ui=None):
+        self.radio = radio
+        self.debug = debug
+        self.ui = ui
+        self.last_logged_pct = -1
+        self.total_bytes = 0
+
+    def send(self, frame):
+        ack = self.radio.send(frame)
+        if self.ui is not None:
+            self.ui.pulse_activity()
+        return ack
+
+    def receive(self, timeout):
+        frame = self.radio.receive(timeout)
+        if frame is not None:
+            if self.ui is not None:
+                self.ui.pulse_activity()
+            try:
+                kind, session, sequence, body = unpack_packet(frame)
+                if kind == START:
+                    import struct
+                    self.total_bytes = struct.unpack("!I", body[:4])[0]
+                    console("RX START received! Incoming air payload: {} bytes".format(self.total_bytes))
+                    self.last_logged_pct = -1
+                elif kind == DATA and self.total_bytes > 0:
+                    rx_bytes = min(self.total_bytes, sequence * 16)
+                    pct = (100 * rx_bytes) // self.total_bytes
+                    if self.debug or sequence == 1 or pct >= self.last_logged_pct + 5:
+                        console("RX receiving DATA seq={} ({}/{} bytes, {}%)".format(
+                            sequence, rx_bytes, self.total_bytes, pct))
+                        self.last_logged_pct = (pct // 5) * 5
+                elif kind == FINISH:
+                    console("RX FINISH packet received! Verifying CRC32 and saving...")
+            except Exception:
+                pass
         return frame
 
 
@@ -83,31 +228,139 @@ def read_txt(path):
     return data
 
 
-class CompletedFile:
-    """Same-directory staging + atomic no-replace publication on a local POSIX FS."""
+def load_tx_payload(path, batch=True, compress=True):
+    """Load a single .txt file or automatically pack all .txt files in a directory."""
+    if path.is_dir():
+        txt_files = sorted(
+            p for p in path.iterdir()
+            if p.is_file() and p.suffix.lower() == ".txt" and not p.name.startswith(".")
+        )
+        if not txt_files:
+            raise ValueError(f"no .txt files found in directory {path}")
+        if len(txt_files) == 1 and not batch:
+            chosen = txt_files[0]
+            console(f"Auto-selected TXT from directory: {chosen.name}")
+            raw = read_txt(chosen)
+            return maybe_compress(raw, compress), [chosen.name], len(raw)
 
+        parts = [BATCH_MAGIC, len(txt_files).to_bytes(4, "big")]
+        names = []
+        for f in txt_files:
+            raw_name = f.name.encode("utf-8")
+            if len(raw_name) > 255:
+                raise ValueError(f"filename too long: {f.name}")
+            file_bytes = read_txt(f)
+            parts.append(len(raw_name).to_bytes(2, "big"))
+            parts.append(raw_name)
+            parts.append(len(file_bytes).to_bytes(4, "big"))
+            parts.append(file_bytes)
+            names.append(f.name)
+        raw_payload = b"".join(parts)
+        payload = maybe_compress(raw_payload, compress)
+        if len(payload) > MAX_BYTES:
+            raise ValueError("combined directory payload exceeds 1 MiB limit")
+        return payload, names, len(raw_payload)
+    else:
+        raw = read_txt(path)
+        return maybe_compress(raw, compress), [path.name], len(raw)
+
+
+def unpack_batch_payload(data):
+    if not data.startswith(BATCH_MAGIC):
+        return None
+    idx = len(BATCH_MAGIC)
+    if len(data) < idx + 4:
+        raise ValueError("corrupted batch header")
+    count = int.from_bytes(data[idx:idx + 4], "big")
+    idx += 4
+    items = []
+    for _ in range(count):
+        if len(data) < idx + 2:
+            raise ValueError("corrupted batch filename length")
+        name_len = int.from_bytes(data[idx:idx + 2], "big")
+        idx += 2
+        name = data[idx:idx + name_len].decode("utf-8")
+        idx += name_len
+        if "/" in name or "\\" in name or name in ("", ".", ".."):
+            raise ValueError(f"unsafe filename in batch: {name}")
+        if len(data) < idx + 4:
+            raise ValueError("corrupted batch file size")
+        size = int.from_bytes(data[idx:idx + 4], "big")
+        idx += 4
+        if len(data) < idx + size:
+            raise ValueError("truncated batch file content")
+        content = data[idx:idx + size]
+        idx += size
+        items.append((name, content))
+    return items
+
+
+class CompletedFile:
     def __init__(self, path):
         self.path = path
         self.stage = None
-        if path.suffix.lower() != ".txt":
-            raise ValueError("output must be an explicit .txt path")
-        if os.path.lexists(path):
-            raise FileExistsError("output already exists; choose a new path")
+        self.saved_bytes = 0
+        self.is_dir_target = path.exists() and path.is_dir() or path.suffix == ""
+        if not self.is_dir_target:
+            if path.suffix.lower() != ".txt":
+                raise ValueError("output must be an explicit .txt path or a directory")
+            if os.path.lexists(path):
+                raise FileExistsError("output already exists; choose a new path")
 
     def __enter__(self):
+        if self.is_dir_target:
+            self.path.mkdir(parents=True, exist_ok=True)
+            return self
         descriptor, name = tempfile.mkstemp(prefix=".pi-txt-", suffix=".partial",
                                             dir=self.path.parent)
         self.stage = Path(name)
         os.close(descriptor)
         return self
 
+    def _atomic_write_single(self, target_path, content):
+        if os.path.lexists(target_path):
+            target_path.unlink()
+        descriptor, name = tempfile.mkstemp(prefix=".pi-txt-", suffix=".partial",
+                                            dir=target_path.parent)
+        stage = Path(name)
+        os.close(descriptor)
+        try:
+            with stage.open("wb") as target:
+                target.write(content)
+                target.flush()
+                os.fsync(target.fileno())
+            os.link(stage, target_path)
+            stage.unlink()
+            directory = os.open(target_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            stage.unlink(missing_ok=True)
+
     def save(self, content):
+        content = maybe_decompress(content)
+        self.saved_bytes = len(content)
+        batch_items = unpack_batch_payload(content)
+        if batch_items is not None:
+            out_dir = self.path if self.is_dir_target else self.path.parent
+            saved_paths = []
+            for name, file_bytes in batch_items:
+                dest = out_dir / name
+                self._atomic_write_single(dest, file_bytes)
+                saved_paths.append(str(dest))
+            console(f"RX batch unpacked: {len(saved_paths)} files saved in {out_dir}")
+            return
+        if self.is_dir_target:
+            dest = self.path / "ricevuto.txt"
+            self._atomic_write_single(dest, content)
+            self.path = dest
+            return
         with self.stage.open("wb") as target:
             target.write(content)
             target.flush()
             os.fsync(target.fileno())
-        # link() fails if the final name appeared since preflight, including symlinks.
-        # The final name is never visible with partial content.
         os.link(self.stage, self.path)
         self.stage.unlink()
         self.stage = None
@@ -123,13 +376,12 @@ class CompletedFile:
 
 
 @contextmanager
-def hardware_deadline():
-    """Linux main-thread watchdog also bounds dependency startup and file I/O."""
+def hardware_deadline(seconds=EXTENDED_WALL_TIMEOUT):
     def expired(signum, frame):
         raise TimeoutError("hardware operation deadline; remote save may be unconfirmed")
 
     old_handler = signal.signal(signal.SIGALRM, expired)
-    signal.setitimer(signal.ITIMER_REAL, TOTAL_TIMEOUT + RECEIPT_LINGER + 15)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
     try:
         yield
     finally:
@@ -139,7 +391,6 @@ def hardware_deadline():
 
 @contextmanager
 def exclusive_radio():
-    """One process owns this radio; no simultaneous local TX and RX."""
     descriptor = os.open("/tmp/pi-astra-radio.lock",
                          os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
@@ -149,21 +400,20 @@ def exclusive_radio():
         os.close(descriptor)
 
 
-
 class ButtonLed:
-    """Opt-in common-cathode BCM17/27/22 RGB and BCM23/GND button.
-
-    Uses the already-required pigpio client, no gpiozero import or callbacks.
-    Waiting does not open the radio. One invocation sends at most once.
-    """
     PINS = (17, 27, 22)
     BUTTON = 23
-    DEBOUNCE = 0.05
+    DEBOUNCE = 0.02
+    BLINK_INTERVAL = 0.25
+    ACTIVITY_MIN_INTERVAL = 0.04
 
-    def __init__(self):
+    def __init__(self, role="tx"):
+        self.role = role.upper()
         self.pi = None
         self.io = None
         self.outputs = []
+        self._last_activity_toggle = 0.0
+        self._blue_state = False
 
     def _call(self, action, *args):
         with self.io.budget(1.0):
@@ -173,7 +423,7 @@ class ButtonLed:
         return result
 
     def __enter__(self):
-        with hardware_deadline():
+        with hardware_deadline(15):
             return self._open()
 
     def _open(self):
@@ -187,7 +437,6 @@ class ButtonLed:
                 raise OSError("local pigpiod unavailable at 127.0.0.1:8888")
             self.io = _PiIO(self.pi)
             for pin in self.PINS:
-                # Common GND: latch low BEFORE output, including retained state.
                 self._call(self.pi.write, pin, 0)
                 self.outputs.append(pin)
                 self._call(self.pi.set_mode, pin, pigpio.OUTPUT)
@@ -199,48 +448,84 @@ class ButtonLed:
             self.close()
             raise
 
-    def color(self, value):
-        # Switch all channels off first to avoid intermediate mixed colors.
-        for pin in self.outputs:
-            self._call(self.pi.write, pin, 0)
+    def _set_raw_rgb(self, value):
         for pin, active in zip(self.PINS, value):
-            if active:
-                self._call(self.pi.write, pin, 1)
-        console("LED command completed: {} (physical light not sensed)".format(
-            {(0, 0, 0): "off", (0, 0, 1): "blue / attempting TX",
-             (0, 1, 0): "green / saved receipt confirmed",
-             (1, 0, 0): "red / attempt unconfirmed"}.get(value, "custom")))
+            self._call(self.pi.write, pin, 1 if active else 0)
 
-    def _stable(self, level):
-        since = None
-        while True:
-            value = self._call(self.pi.read, self.BUTTON)
-            if value not in (0, 1):
-                raise OSError("invalid button GPIO level")
-            now = time.monotonic()
-            if value == level:
-                if since is None:
-                    since = now
-                elif now - since >= self.DEBOUNCE:
-                    return
-            else:
-                since = None
-            time.sleep(0.01)
+    def color(self, value, log=True):
+        self._set_raw_rgb((0, 0, 0))
+        self._set_raw_rgb(value)
+        self._blue_state = (value == (0, 0, 1))
+        if log:
+            console("LED state: {}".format(
+                {(0, 0, 0): "off",
+                 (1, 1, 1): "white / waiting for button press ({})".format(self.role),
+                 (0, 0, 1): "blue / PC-activity mode ({})".format(self.role),
+                 (0, 1, 0): "green / {} completed and saved".format(self.role),
+                 (1, 0, 0): "red / {} error or unconfirmed".format(self.role)}.get(value, "custom")))
+
+    def pulse_activity(self):
+        now = time.monotonic()
+        if now - self._last_activity_toggle >= self.ACTIVITY_MIN_INTERVAL:
+            self._blue_state = not self._blue_state
+            try:
+                self._call(self.pi.write, 22, 1 if self._blue_state else 0)
+            except Exception:
+                pass
+            self._last_activity_toggle = now
+
+    def _wait_button_cycle(self, blink_rgb=None):
+        last_toggle = time.monotonic()
+        led_on = True
+        if blink_rgb is not None:
+            self._set_raw_rgb(blink_rgb)
+
+        for target_level, message in ((1, "Button armed: released"),
+                                      (0, "Button press stable; waiting for release"),
+                                      (1, "Button release stable")):
+            since = None
+            while True:
+                now = time.monotonic()
+                if blink_rgb is not None:
+                    if target_level == 1 and message == "Button release stable":
+                        if not led_on:
+                            self._set_raw_rgb(blink_rgb)
+                            led_on = True
+                    elif now - last_toggle >= self.BLINK_INTERVAL:
+                        led_on = not led_on
+                        self._set_raw_rgb(blink_rgb if led_on else (0, 0, 0))
+                        last_toggle = now
+
+                value = self._call(self.pi.read, self.BUTTON)
+                if value not in (0, 1):
+                    raise OSError("invalid button GPIO level")
+                if value == target_level:
+                    if since is None:
+                        since = now
+                    elif now - since >= self.DEBOUNCE:
+                        break
+                else:
+                    since = None
+                time.sleep(0.005)
+            console(message)
 
     def wait(self):
-        print("Release button, then press and release to send once; Ctrl-C cancels.",
+        console("LED state: blinking white / waiting for button press to start {}".format(self.role))
+        print("Blinking WHITE: press and release button to start {}; Ctrl-C cancels.".format(self.role),
               file=sys.stderr, flush=True)
-        # A button held at startup must be released before arming a new press.
-        for level, message in ((1, "Button armed: released"),
-                               (0, "Button press stable; waiting for release"),
-                               (1, "Button release stable; starting one TX")):
-            self._stable(level)
-            console(message)
+        self._wait_button_cycle(blink_rgb=(1, 1, 1))
 
     def result(self, saved):
         try:
-            self.color((0, 1, 0) if saved else (1, 0, 0))
-            time.sleep(2)
+            if saved:
+                console("LED state: blinking green / transfer complete! Press button to exit.")
+                print("Blinking GREEN: transfer complete! Press and release button to finish.",
+                      file=sys.stderr, flush=True)
+                self._wait_button_cycle(blink_rgb=(0, 1, 0))
+                self.color((0, 0, 0), log=False)
+            else:
+                self.color((1, 0, 0), log=True)
+                time.sleep(3)
         except Exception as error:
             print("LED indication unavailable: {}".format(error), file=sys.stderr)
 
@@ -249,15 +534,12 @@ class ButtonLed:
             return
         try:
             if self.io is not None and self.pi.connected:
-                if self.io.broken:
-                    print("GPIO connection failed; LED off cannot be verified.",
-                          file=sys.stderr)
-                else:
+                if not self.io.broken:
                     with self.io.budget(0.2):
                         for pin in self.outputs:
                             self.io.call(self.pi.write, pin, 0)
-        except Exception as error:
-            print("LED off not verified: {}".format(error), file=sys.stderr)
+        except Exception:
+            pass
         finally:
             if self.io is not None:
                 self.io.disconnect()
@@ -270,51 +552,49 @@ class ButtonLed:
 
 
 def radio_main(argv):
-    parser = argparse.ArgumentParser(description="PT/1 single-file radio demo")
+    parser = argparse.ArgumentParser(description="PT/1 single-file or directory radio demo")
     parser.add_argument("role", choices=("tx", "rx"))
-    parser.add_argument("file", type=Path, help="explicit SD input (TX) or new output (RX)")
-    parser.add_argument("--rate", choices=("250k", "2m"), required=True,
-                        help="both peers must match; no inferred MRM/NM/SRI mode")
-    parser.add_argument("--hardware-checked", action="store_true", required=True,
-                        help="attest reviewed module, power, wiring and antenna checks")
-    parser.add_argument("--button-led", action="store_true",
-                        help="TX only: common-GND RGB, press/release once to send")
-    parser.add_argument("--debug", action="store_true",
-                        help="TX: log every request/link ACK/reply; never file contents")
+    parser.add_argument("file", type=Path, help="SD input file/dir (TX) or output file/dir (RX)")
+    parser.add_argument("--rate", choices=("250k", "2m"), required=True)
+    parser.add_argument("--hardware-checked", action="store_true", required=True)
+    parser.add_argument("--batch", action="store_true", default=True)
+    parser.add_argument("--compress", dest="compress", action="store_true", default=True)
+    parser.add_argument("--no-compress", dest="compress", action="store_false")
+    parser.add_argument("--button-led", dest="button_led", action="store_true", default=True)
+    parser.add_argument("--no-button-led", dest="button_led", action="store_false")
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args(argv)
-    if args.button_led and args.role != "tx":
-        parser.error("--button-led is TX only; RX still starts immediately")
     try:
-        # Validate paths/data before any driver import or GPIO/device access.
-        content = read_txt(args.file) if args.role == "tx" else None
-        output = CompletedFile(args.file) if args.role == "rx" else None
         if args.role == "tx":
-            console("TXT loaded: {} ({} bytes; snapshot held in memory)".format(
-                args.file, len(content)))
+            content, names, raw_len = load_tx_payload(args.file, args.batch, args.compress)
+            output = None
+            console("TXT loaded: {} ({} original bytes, {} air bytes; files={})".format(
+                args.file, raw_len, len(content), ", ".join(names)))
         else:
-            console("RX destination checked: {} (must not exist)".format(args.file))
+            content = None
+            output = CompletedFile(args.file)
+            console("RX destination checked: {}".format(args.file))
         from radio_adapter import open_radio
 
-        with exclusive_radio(), (ButtonLed() if args.button_led else nullcontext()) as ui:
+        with exclusive_radio(), (ButtonLed(args.role) if args.button_led else nullcontext()) as ui:
             if ui is not None:
                 ui.wait()
             try:
-                with hardware_deadline():
+                with hardware_deadline(EXTENDED_WALL_TIMEOUT):
                     report = perform_transfer(args, content, output, open_radio, ui)
             except BaseException:
                 if ui is not None:
                     ui.result(False)
                 raise
+            report.update({"channel": 74, "rate": args.rate, "pa": "MIN"})
+            console("{} complete: {}".format(args.role.upper(),
+                    "remote SAVED confirmed" if args.role == "tx" else "local file saved"))
             if ui is not None:
                 ui.result(True)
-        report.update({"channel": 74, "rate": args.rate, "pa": "MIN"})
-        console("{} complete: {}".format(args.role.upper(),
-                "remote SAVED confirmed" if args.role == "tx" else "local file saved"))
         print(json.dumps(report))
         return 0
     except KeyboardInterrupt:
-        print("Interrupted; transfer not confirmed. Inspect any completed RX file.",
-              file=sys.stderr)
+        print("Interrupted; transfer not confirmed.", file=sys.stderr)
         return 130
     except (OSError, ValueError, RuntimeError, ImportError) as error:
         print("Failed: {}. No transfer success claimed.".format(error), file=sys.stderr)
@@ -330,7 +610,7 @@ def perform_transfer(args, content, output, open_radio, ui):
         with open_radio(args.role, args.rate, args.hardware_checked) as radio:
             console("TX radio ready; beginning START/data/FINISH ({} data blocks)".format(
                 (len(content) + 15) // 16))
-            observed = LoggedTxRadio(radio, len(content), args.debug)
+            observed = LoggedTxRadio(radio, len(content), args.debug, ui=ui)
             frames = send_v1(content, session, args.rate, observed, time.monotonic)
         report = {"mode": "tx", "protocol": "PT/1", "bytes": len(content),
                   "frames": frames, "remote_saved_receipt": True,
@@ -338,13 +618,14 @@ def perform_transfer(args, content, output, open_radio, ui):
     else:
         with output:
             with open_radio(args.role, args.rate, args.hardware_checked) as radio:
-                console("RX radio ready; waiting for START (30s); RX also transmits replies")
+                console("RX radio ready; waiting for START (180s); RX also transmits replies")
+                observed_rx = LoggedRxRadio(radio, args.debug, ui=ui)
                 def save_and_log(data):
                     output.save(data)
-                    console("RX TXT saved atomically: {} bytes; sending SAVED reply".format(len(data)))
-                count = receive_v1(args.rate, radio, save_and_log, time.monotonic)
-        report = {"mode": "rx", "protocol": "PT/1", "bytes": count,
-                  "local_file_saved": True, "output": str(args.file)}
+                    console("RX TXT saved atomically: {} bytes; sending SAVED reply".format(output.saved_bytes))
+                count = receive_v1(args.rate, observed_rx, save_and_log, time.monotonic)
+        report = {"mode": "rx", "protocol": "PT/1", "bytes": output.saved_bytes or count,
+                  "local_file_saved": True, "output": str(output.path)}
     return report
 
 
@@ -354,8 +635,7 @@ def main(argv=None) -> int:
         return radio_main(argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("file", type=Path, help="explicit local .txt input")
-    parser.add_argument("--dry-run", action="store_true", required=True,
-                        help="legacy host framing only; use tx/rx for PT/1")
+    parser.add_argument("--dry-run", action="store_true", required=True)
     args = parser.parse_args(argv)
     if args.file.suffix.lower() != ".txt":
         parser.error("input must be a .txt file")
@@ -374,3 +654,4 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+EOF
