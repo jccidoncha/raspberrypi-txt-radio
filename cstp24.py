@@ -61,8 +61,18 @@ ABORT_CANCEL = 4
 
 # Timing (spec sections 5, 6 and 8), overridable by the caller for field use.
 T_ACK_WAIT = 0.015      # reverse-channel wait after a burst
-T_GAP = 0.005           # receiver idle-gap before proactive NACK
+T_GAP = 0.005           # spec idle-gap arming the proactive-NACK watchdog
 T_SESSION_DEAD = 5.0    # inactivity that returns the receiver to IDLE
+# Host-chosen margin over the spec's T_GAP before the receiver actually
+# transmits a gap NACK: radio_adapter serializes a 5 ms pre-send settle plus
+# airtime and ESB turnaround per frame, so healthy in-burst spacing already
+# exceeds 5 ms on the wire and NACKing at T_GAP would collide with the rest
+# of the burst. Needs on-air validation with the protocol team (PR notes).
+GAP_NACK_IDLE = 0.025
+# After a successful finalize the receiver keeps answering duplicate
+# SESSION_END frames for the sender's whole retry window (5 attempts x 1s),
+# so a lost END_ACK never leaves the sender reporting failure on a saved file.
+END_LINGER = 5.1
 HANDSHAKE_TIMEOUT = 1.0 # per-attempt wait for SESSION_ACK / SESSION_END_ACK
 START_TIMEOUT = 30.0    # receiver wait for the first SESSION_INIT
 TOTAL_TIMEOUT = 300.0   # whole-transfer bound
@@ -343,8 +353,8 @@ def receive_session(radio: DuplexRadio, now: Callable[[], float],
                     wait_deadline = moment + START_TIMEOUT
                     continue
                 if (active is not None and active["missing"] > 0
-                        and moment - last_data > T_GAP
-                        and moment - last_gap_nack > T_GAP):
+                        and moment - last_data > GAP_NACK_IDLE
+                        and moment - last_gap_nack > GAP_NACK_IDLE):
                     bitmap = bytearray(BITMAP_BYTES)
                     for seq in range(active["count"]):
                         if not active["seen"][seq]:
@@ -360,19 +370,30 @@ def receive_session(radio: DuplexRadio, now: Callable[[], float],
         kind, frame_session, sequence, body = parsed
 
         if kind == SESSION_INIT:
-            ver, init_algo, chunk_size, file_size, init_total, init_crc = \
+            ver, init_algo, chunk_size, init_size, init_total, init_crc = \
                 _BODY[SESSION_INIT].unpack(body[:20])
-            if ver != VERSION or chunk_size != CHUNK_BYTES or file_size < 0:
+            if ver != VERSION or chunk_size != CHUNK_BYTES or init_size < 0:
                 continue
-            if init_total != (file_size + CHUNK_BYTES - 1) // CHUNK_BYTES:
+            if init_total != (init_size + CHUNK_BYTES - 1) // CHUNK_BYTES:
                 continue
             if init_algo not in (ALGO_NONE, ALGO_ZLIB):
                 radio.send(frame(SESSION_ACK, frame_session, 0,
                                  _BODY[SESSION_ACK].pack(BAD_ALGO, 0, 0)))
                 continue
+            if session is not None and (
+                    frame_session != session
+                    or (init_size, init_crc, init_total, init_algo)
+                    != (file_size, file_crc, total_chunks, algo)):
+                # A competing session must never discard the active transfer
+                # or its durable checkpoint; an identical INIT is the
+                # idempotent duplicate handled below.
+                radio.send(frame(SESSION_ACK, frame_session, 0,
+                                 _BODY[SESSION_ACK].pack(BUSY, 0, 0)))
+                continue
             session = frame_session
             algo = init_algo
             total_chunks = init_total
+            file_size = init_size
             file_crc = init_crc
             expect = lookup(file_size, file_crc, total_chunks)
             if not 0 <= expect <= total_chunks:
@@ -402,9 +423,10 @@ def receive_session(radio: DuplexRadio, now: Callable[[], float],
                     radio.send(frame(CHUNK_ACK, session, last_committed[1],
                                      _BODY[CHUNK_ACK].pack(index, 0)))
                 continue
+            expected_raw = min(CHUNK_BYTES, file_size - index * CHUNK_BYTES)
             if index > expect or count > MAX_PACKETS \
                     or count != packets_for(wire_len) \
-                    or wire_len > CHUNK_BYTES or raw_len > CHUNK_BYTES \
+                    or wire_len > CHUNK_BYTES or raw_len != expected_raw \
                     or (flags & 1 and algo != ALGO_ZLIB):
                 continue
             active = {"index": index, "raw_len": raw_len, "wire_len": wire_len,
@@ -423,7 +445,9 @@ def receive_session(radio: DuplexRadio, now: Callable[[], float],
                 continue
             length = min(BODY_BYTES,
                          active["wire_len"] - sequence * BODY_BYTES)
-            if length <= 0:
+            if length <= 0 or len(body) < length:
+                # A short body written into a longer slice would shift the
+                # bytes already assembled; wait for a well-formed copy.
                 continue
             offset = sequence * BODY_BYTES
             if not active["seen"][sequence]:
@@ -462,12 +486,34 @@ def receive_session(radio: DuplexRadio, now: Callable[[], float],
             end_total, end_crc = _BODY[SESSION_END].unpack(body[:8])
             if end_total != total_chunks or expect < total_chunks:
                 continue
+            if end_crc != file_crc:
+                radio.send(frame(SESSION_END_ACK, session, 0,
+                                 _BODY[SESSION_END_ACK].pack(1)))
+                raise SessionError(
+                    "SESSION_END metadata disagrees with SESSION_INIT")
             ok = finalize(end_crc)
             radio.send(frame(SESSION_END_ACK, session, 0,
                              _BODY[SESSION_END_ACK].pack(0 if ok else 1)))
             if not ok:
                 raise SessionError("whole-file CRC mismatch at finalize")
             stats["file_crc32"] = "{:08x}".format(end_crc)
+            # If the first END_ACK was lost the sender retries END; keep
+            # answering duplicates for its whole retry window instead of
+            # leaving it reporting failure on a file we already published.
+            linger = min(deadline, moment + END_LINGER)
+            while now() < linger:
+                raw = radio.receive(max(0.0, linger - now()))
+                if raw is None:
+                    break
+                parsed = parse(raw)
+                if parsed is None:
+                    continue
+                kind, frame_session, _, body = parsed
+                if kind == SESSION_END and frame_session == session:
+                    end_total, end_crc = _BODY[SESSION_END].unpack(body[:8])
+                    if end_total == total_chunks and end_crc == file_crc:
+                        radio.send(frame(SESSION_END_ACK, session, 0,
+                                         _BODY[SESSION_END_ACK].pack(0)))
             return stats
 
     raise SessionError("CSTP-24 receive timeout; session not completed")

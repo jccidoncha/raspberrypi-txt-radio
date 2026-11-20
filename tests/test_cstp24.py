@@ -101,6 +101,8 @@ def run_session(content, rx_transform=None, tx_transform=None, resume_store=None
 
     with mock.patch.object(c, "T_ACK_WAIT", 0.1), \
             mock.patch.object(c, "T_GAP", 0.05), \
+            mock.patch.object(c, "GAP_NACK_IDLE", 0.05), \
+            mock.patch.object(c, "END_LINGER", 0.05), \
             mock.patch.object(c, "START_TIMEOUT", 5.0):
         worker = threading.Thread(target=receive)
         worker.start()
@@ -270,7 +272,8 @@ class ScriptedReceiverTests(unittest.TestCase):
         data = [c.frame(c.CHUNK_DATA, 7, s,
                         wire[s * 27:(s + 1) * 27]) for s in range(count)]
         abort = c.frame(c.SESSION_ABORT, 7, 0, bytes([c.ABORT_CANCEL]))
-        radio = ScriptedRadio([init_frame(), start] + data + [start, abort], clock)
+        init = init_frame(size=len(content), crc=c.crc32(content))
+        radio = ScriptedRadio([init, start] + data + [start, abort], clock)
         commits = []
         with self.assertRaises(c.SessionError):
             c.receive_session(radio, clock, lambda s, crc, total: 0,
@@ -280,6 +283,93 @@ class ScriptedReceiverTests(unittest.TestCase):
         acks = [f for f in radio.sent
                 if c.parse(f) and c.parse(f)[0] == c.CHUNK_ACK]
         self.assertEqual(len(acks), 2)  # duplicate START re-acked, no rewrite
+
+    def test_competing_init_gets_busy_and_keeps_active_session(self):
+        clock = FakeClock()
+        abort = c.frame(c.SESSION_ABORT, 7, 0, bytes([c.ABORT_CANCEL]))
+        radio = ScriptedRadio(
+            [init_frame(session=7, size=10, chunks=1, crc=0xAAAA),
+             init_frame(session=8, size=20, chunks=1, crc=0xBBBB),
+             init_frame(session=7, size=99, chunks=1, crc=0xCCCC),  # same id, new file
+             abort], clock)
+        lookups = []
+        with self.assertRaises(c.SessionError):
+            c.receive_session(radio, clock,
+                              lambda s, crc, total: lookups.append((s, crc)) or 0,
+                              lambda i, raw: None, lambda crc: True)
+        self.assertEqual(lookups, [(10, 0xAAAA)])  # competitors never touch state
+        acks = [c._BODY[c.SESSION_ACK].unpack(c.parse(f)[3][:7])[0]
+                for f in radio.sent if c.parse(f) and c.parse(f)[0] == c.SESSION_ACK]
+        self.assertEqual(acks, [c.OK_NEW, c.BUSY, c.BUSY])
+
+    def test_duplicate_end_reacked_during_linger(self):
+        clock = FakeClock()
+        content = b"linger window\n" * 8
+        wire, flag = c.compress_chunk(content)
+        count = c.packets_for(len(wire))
+        crc = c.crc32(content)
+        frames = [init_frame(size=len(content), chunks=1, crc=crc),
+                  c.frame(c.CHUNK_START, 7, count,
+                          c._BODY[c.CHUNK_START].pack(0, len(content), len(wire),
+                                                      c.crc32(wire), flag))]
+        frames += [c.frame(c.CHUNK_DATA, 7, s, wire[s * 27:(s + 1) * 27])
+                   for s in range(count)]
+        end = c.frame(c.SESSION_END, 7, 0, c._BODY[c.SESSION_END].pack(1, crc))
+        radio = ScriptedRadio(frames + [end, end], clock)  # first END_ACK lost
+        stats = c.receive_session(radio, clock, lambda s, crc_, total: 0,
+                                  lambda i, raw: None, lambda crc_: True)
+        end_acks = [f for f in radio.sent
+                    if c.parse(f) and c.parse(f)[0] == c.SESSION_END_ACK]
+        self.assertEqual(len(end_acks), 2)  # initial answer + duplicate re-ACK
+        self.assertEqual(stats["file_crc32"], "{:08x}".format(crc))
+
+    def test_end_metadata_mismatch_rejected(self):
+        clock = FakeClock()
+        content = b"mismatch\n" * 8
+        wire, flag = c.compress_chunk(content)
+        count = c.packets_for(len(wire))
+        crc = c.crc32(content)
+        frames = [init_frame(size=len(content), chunks=1, crc=crc),
+                  c.frame(c.CHUNK_START, 7, count,
+                          c._BODY[c.CHUNK_START].pack(0, len(content), len(wire),
+                                                      c.crc32(wire), flag))]
+        frames += [c.frame(c.CHUNK_DATA, 7, s, wire[s * 27:(s + 1) * 27])
+                   for s in range(count)]
+        frames.append(c.frame(c.SESSION_END, 7, 0,
+                              c._BODY[c.SESSION_END].pack(1, crc ^ 1)))
+        radio = ScriptedRadio(frames, clock)
+        with self.assertRaises(c.SessionError):
+            c.receive_session(radio, clock, lambda s, crc_, total: 0,
+                              lambda i, raw: None,
+                              lambda crc_: self.fail("finalize must not run"))
+        end_acks = [c.parse(f) for f in radio.sent
+                    if c.parse(f) and c.parse(f)[0] == c.SESSION_END_ACK]
+        status, = c._BODY[c.SESSION_END_ACK].unpack(end_acks[0][3][:1])
+        self.assertEqual(status, 1)
+
+    def test_short_data_frame_does_not_shift_assembly(self):
+        clock = FakeClock()
+        content = bytes(range(100))  # incompressible: ALGO_NONE keeps 1:1 bytes
+        wire, flag = c.compress_chunk(content, compress=False)
+        count = c.packets_for(len(wire))
+        crc = c.crc32(content)
+        committed = {}
+        frames = [init_frame(algo=c.ALGO_NONE, size=len(content), chunks=1, crc=crc),
+                  c.frame(c.CHUNK_START, 7, count,
+                          c._BODY[c.CHUNK_START].pack(0, len(content), len(wire),
+                                                      c.crc32(wire), flag)),
+                  c.frame(c.CHUNK_DATA, 7, 0, wire[:10])]  # truncated body
+        frames += [c.frame(c.CHUNK_DATA, 7, s, wire[s * 27:(s + 1) * 27])
+                   for s in range(count)]
+        frames.append(c.frame(c.SESSION_END, 7, 0,
+                              c._BODY[c.SESSION_END].pack(1, crc)))
+        radio = ScriptedRadio(frames, clock)
+        stats = c.receive_session(
+            radio, clock, lambda s, crc_, total: 0,
+            lambda i, raw: committed.update({i: raw}),
+            lambda crc_: c.crc32(committed[0]) == crc_)
+        self.assertEqual(committed[0], content)
+        self.assertEqual(stats["chunks"], 1)
 
     def test_data_without_start_draws_crc_nack(self):
         clock = FakeClock()
@@ -323,6 +413,35 @@ class ReceiverFileTests(unittest.TestCase):
                 self.assertEqual(target.read_bytes(), content)
                 self.assertEqual(list(Path(folder).iterdir()), [target])
 
+    def test_lookup_truncates_uncheckpointed_part_tail(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "out.txt"
+            with quick_mode.CompletedFile(target) as output:
+                files = quick_mode.CstpReceiverFiles(output)
+                content = b"q" * 9000  # 3 chunks: 4096 + 4096 + 808
+                crc = c.crc32(content)
+                self.assertEqual(files.lookup(len(content), crc, 3), 0)
+                files.commit(0, content[:c.CHUNK_BYTES])
+                files.commit(1, content[c.CHUNK_BYTES:2 * c.CHUNK_BYTES])
+                # Crash between the chunk-2 .part write and its checkpoint.
+                with files.part.open("ab") as tail:
+                    tail.write(content[2 * c.CHUNK_BYTES:])
+                again = quick_mode.CstpReceiverFiles(output)
+                self.assertEqual(again.lookup(len(content), crc, 3), 2)
+                self.assertEqual(again.part.stat().st_size, 2 * c.CHUNK_BYTES)
+
+    def test_finalize_rejects_wrong_size(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "out.txt"
+            with quick_mode.CompletedFile(target) as output:
+                files = quick_mode.CstpReceiverFiles(output)
+                content = b"size check\n"
+                crc = c.crc32(content)
+                self.assertEqual(files.lookup(len(content), crc, 1), 0)
+                files.part.write_bytes(content[:-1])  # one byte short
+                self.assertFalse(files.finalize(crc))
+                self.assertFalse(target.exists())
+
     def test_cli_rx_cstp24_timeout_leaves_no_files(self):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / "out.txt"
@@ -337,6 +456,50 @@ class ReceiverFileTests(unittest.TestCase):
                      "--hardware-checked"]), 1)
             self.assertEqual(list(Path(folder).iterdir()), [])
             manager.__exit__.assert_called_once()
+
+    def test_cli_tx_cstp24_completes_session(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "in.txt"
+            content = b"cli tx path\n" * 50
+            source.write_bytes(content)
+            tx_end, rx_end = wire_pair()
+            manager = unittest.mock.MagicMock()
+            manager.__enter__.return_value = tx_end
+            box = {"committed": {}, "final": None, "error": None}
+
+            def receive():
+                try:
+                    c.receive_session(
+                        rx_end, __import__("time").monotonic,
+                        lambda s, crc, total: 0,
+                        lambda i, raw: box["committed"].update({i: raw}),
+                        self._finalize(box))
+                except Exception as error:
+                    box["error"] = error
+
+            with mock.patch("radio_adapter.open_radio", return_value=manager), \
+                    mock.patch.object(c, "END_LINGER", 0.05), \
+                    mock.patch.object(c, "START_TIMEOUT", 5.0), \
+                    mock.patch("sys.stderr", new_callable=__import__("io").StringIO), \
+                    mock.patch("sys.stdout", new_callable=__import__("io").StringIO):
+                worker = threading.Thread(target=receive)
+                worker.start()
+                rc = quick_mode.main(["tx", str(source), "--rate", "250k",
+                                      "--hardware-checked"])
+                worker.join(timeout=20)
+            self.assertEqual(rc, 0)
+            self.assertIsNone(box["error"])
+            self.assertEqual(box["final"], content)
+
+    @staticmethod
+    def _finalize(box):
+        def finalize(file_crc):
+            data = b"".join(box["committed"][i] for i in sorted(box["committed"]))
+            if c.crc32(data) != file_crc:
+                return False
+            box["final"] = data
+            return True
+        return finalize
 
 
 if __name__ == "__main__":

@@ -573,6 +573,32 @@ class PadRadio:
         return self.radio.receive(timeout)
 
 
+class CstpTxRadio:
+    """Observe CSTP-24 TX without assuming the PT/1 wire format.
+
+    LoggedTxRadio parses every frame as PT/1 and would reject the 25-byte
+    CSTP-24 SESSION_INIT; this wrapper only reports activity and debug info.
+    """
+
+    def __init__(self, radio, debug=False, ui=None):
+        self.radio, self.debug, self.ui = radio, debug, ui
+
+    def send(self, frame):
+        ack = self.radio.send(frame)
+        if self.ui is not None and ack:
+            self.ui.pulse_activity()
+        if self.debug:
+            console("TX CSTP-24 frame {} bytes link-ACK={}".format(
+                len(frame), bool(ack)))
+        return ack
+
+    def receive(self, timeout):
+        frame = self.radio.receive(timeout)
+        if frame is not None and self.ui is not None:
+            self.ui.pulse_activity()
+        return frame
+
+
 class CstpReceiverFiles:
     """Durable .part/.state checkpoint callbacks staged next to the RX target.
 
@@ -610,10 +636,21 @@ class CstpReceiverFiles:
                 expected = (file_size if candidate == total_chunks
                             else candidate * cstp24.CHUNK_BYTES)
                 try:
-                    if self.part.stat().st_size == expected:
-                        next_chunk = candidate
+                    actual = self.part.stat().st_size
                 except OSError:
-                    next_chunk = 0
+                    actual = -1
+                if actual > expected:
+                    # Crash between the .part write and the checkpoint
+                    # replace: drop the uncheckpointed tail, keep the prefix.
+                    with self.part.open("r+b") as target:
+                        target.truncate(expected)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    console("Dropped uncheckpointed .part tail ({} -> {} bytes)".format(
+                        actual, expected))
+                    actual = expected
+                if actual == expected:
+                    next_chunk = candidate
         if next_chunk == 0:
             self._reset()
         else:
@@ -643,7 +680,7 @@ class CstpReceiverFiles:
 
     def finalize(self, file_crc):
         content = self.part.read_bytes() if self._file_size else b""
-        if cstp24.crc32(content) != file_crc:
+        if len(content) != self._file_size or cstp24.crc32(content) != file_crc:
             return False
         self.output.save(content, air_compressed=False)
         self.saved_bytes = len(content)
@@ -663,7 +700,7 @@ def perform_transfer_cstp24(args, content, output, open_radio, ui):
             total = (len(content) + cstp24.CHUNK_BYTES - 1) // cstp24.CHUNK_BYTES
             console("TX radio ready; {} bytes as {} chunk(s) of 4 KB".format(
                 len(content), total))
-            observed = LoggedTxRadio(padded, len(content), args.debug, ui=ui)
+            observed = CstpTxRadio(padded, args.debug, ui=ui)
             stats = cstp24.send_session(
                 lambda i: content[i * cstp24.CHUNK_BYTES:(i + 1) * cstp24.CHUNK_BYTES],
                 total, len(content), cstp24.crc32(content), session,
