@@ -14,6 +14,7 @@ import tempfile
 import time
 import zlib
 
+import cstp24
 import transfer
 from transfer import (MAX_BYTES, TOTAL_TIMEOUT, RECEIPT_LINGER,
                       crc32, decode, encode, receive_v1, send_v1,
@@ -50,6 +51,7 @@ def _enable_field_optimizations():
     radio_adapter._DeadlineSocket._call = _safe_socket_call
     radio_adapter.SEND_TIMEOUT = 0.35
     radio_adapter.CLEANUP_TIMEOUT = 0.50
+    cstp24.TOTAL_TIMEOUT = 3600.0
 
 
 def maybe_compress(data: bytes, enabled: bool) -> bytes:
@@ -270,8 +272,9 @@ class CompletedFile:
         finally:
             stage.unlink(missing_ok=True)
 
-    def save(self, content):
-        content = maybe_decompress(content)
+    def save(self, content, air_compressed=True):
+        if air_compressed:
+            content = maybe_decompress(content)
         batch_items = unpack_batch_payload(content)
         if batch_items is not None:
             out_dir = self.path if self.is_dir_target else self.path.parent
@@ -486,7 +489,7 @@ class ButtonLed:
 
 
 def radio_main(argv):
-    parser = argparse.ArgumentParser(description="PT/1 single-file or directory radio demo")
+    parser = argparse.ArgumentParser(description="CSTP-24 single-file or directory radio transfer (PT/1 legacy via --legacy-pt1)")
     parser.add_argument("role", choices=("tx", "rx"))
     parser.add_argument("file", type=Path, help="SD input .txt (TX) or new output .txt (RX)")
     parser.add_argument("--rate", choices=("250k", "2m"), required=True,
@@ -499,6 +502,8 @@ def radio_main(argv):
                         help="enable directory/large-file mode, air compression and interactive LEDs")
     parser.add_argument("--auto-finish", action="store_true",
                         help="unattended: no extra button press and no green on success; caller signals the end")
+    parser.add_argument("--legacy-pt1", action="store_true",
+                        help="use the superseded PT/1 protocol instead of CSTP-24; both peers must match")
     parser.add_argument("--debug", action="store_true",
                         help="TX: log every request/link ACK/reply; never file contents")
     args = parser.parse_args(argv)
@@ -509,7 +514,8 @@ def radio_main(argv):
             _enable_field_optimizations()
             args.button_led = True
         if args.role == "tx":
-            content, names = load_tx_payload(args.file, batch=args.batch, compress=args.batch)
+            content, names = load_tx_payload(args.file, batch=args.batch,
+                                             compress=args.batch and args.legacy_pt1)
             output = None
             console("TXT loaded: {} ({} bytes)".format(args.file, len(content)))
         else:
@@ -523,8 +529,10 @@ def radio_main(argv):
             if ui is not None:
                 ui.wait()
             try:
-                with hardware_deadline():
-                    report = perform_transfer(args, content, output, open_radio, ui)
+                watchdog = None if args.legacy_pt1 else int(cstp24.TOTAL_TIMEOUT + 15)
+                with hardware_deadline(watchdog):
+                    transfer_fn = perform_transfer if args.legacy_pt1 else perform_transfer_cstp24
+                    report = transfer_fn(args, content, output, open_radio, ui)
             except BaseException:
                 if ui is not None:
                     ui.result(False)
@@ -543,6 +551,179 @@ def radio_main(argv):
     except (OSError, ValueError, RuntimeError, ImportError) as error:
         print("Failed: {}. No transfer success claimed.".format(error), file=sys.stderr)
         return 1
+
+
+class PadRadio:
+    """Zero-pad CSTP-24 frames to the adapter's fixed 32-byte payload.
+
+    radio_adapter requires exactly 32 bytes; the protocol's shorter control
+    frames are parsed by kind, so padding is transparent. Enabling nRF24
+    Dynamic Payload Length is a hardware-tuning follow-up (spec section 6).
+    """
+
+    def __init__(self, radio):
+        self.radio = radio
+
+    def send(self, frame):
+        if len(frame) > 32:
+            raise ValueError("CSTP-24 frame exceeds 32 bytes")
+        return self.radio.send(frame.ljust(32, b"\0"))
+
+    def receive(self, timeout):
+        return self.radio.receive(timeout)
+
+
+class CstpTxRadio:
+    """Observe CSTP-24 TX without assuming the PT/1 wire format.
+
+    LoggedTxRadio parses every frame as PT/1 and would reject the 25-byte
+    CSTP-24 SESSION_INIT; this wrapper only reports activity and debug info.
+    """
+
+    def __init__(self, radio, debug=False, ui=None):
+        self.radio, self.debug, self.ui = radio, debug, ui
+
+    def send(self, frame):
+        ack = self.radio.send(frame)
+        if self.ui is not None and ack:
+            self.ui.pulse_activity()
+        if self.debug:
+            console("TX CSTP-24 frame {} bytes link-ACK={}".format(
+                len(frame), bool(ack)))
+        return ack
+
+    def receive(self, timeout):
+        frame = self.radio.receive(timeout)
+        if frame is not None and self.ui is not None:
+            self.ui.pulse_activity()
+        return frame
+
+
+class CstpReceiverFiles:
+    """Durable .part/.state checkpoint callbacks staged next to the RX target.
+
+    The .part file keeps every verified chunk at chunk_index * 4096; the
+    20-byte .state record (own CRC-32, atomic replace) lets a later session
+    resume after power loss. Both survive a failed run on purpose; they are
+    removed only after the whole file verifies and publishes atomically.
+    """
+
+    def __init__(self, output):
+        self.output = output
+        base = (output.path / "incoming") if output.is_dir_target else output.path
+        self.part = base.with_name(base.name + ".cstp-part")
+        self.state = base.with_name(base.name + ".cstp-state")
+        self.saved_bytes = 0
+        self._file_size = 0
+        self._file_crc = 0
+
+    def _reset(self):
+        self.part.unlink(missing_ok=True)
+        self.state.unlink(missing_ok=True)
+
+    def lookup(self, file_size, file_crc, total_chunks):
+        self._file_size = file_size
+        self._file_crc = file_crc
+        try:
+            record = cstp24.parse_state(self.state.read_bytes())
+        except OSError:
+            record = None
+        next_chunk = 0
+        if record is not None:
+            state_size, state_crc, candidate = record
+            if (state_size, state_crc) == (file_size, file_crc) \
+                    and 0 <= candidate <= total_chunks:
+                expected = (file_size if candidate == total_chunks
+                            else candidate * cstp24.CHUNK_BYTES)
+                try:
+                    actual = self.part.stat().st_size
+                except OSError:
+                    actual = -1
+                if actual > expected:
+                    # Crash between the .part write and the checkpoint
+                    # replace: drop the uncheckpointed tail, keep the prefix.
+                    with self.part.open("r+b") as target:
+                        target.truncate(expected)
+                        target.flush()
+                        os.fsync(target.fileno())
+                    console("Dropped uncheckpointed .part tail ({} -> {} bytes)".format(
+                        actual, expected))
+                    actual = expected
+                if actual == expected:
+                    next_chunk = candidate
+        if next_chunk == 0:
+            self._reset()
+        else:
+            console("Resuming CSTP-24 session at chunk {} of {}".format(
+                next_chunk, total_chunks))
+        return next_chunk
+
+    def commit(self, index, raw):
+        with self.part.open("r+b" if self.part.exists() else "w+b") as target:
+            target.seek(index * cstp24.CHUNK_BYTES)
+            target.write(raw)
+            target.flush()
+            os.fsync(target.fileno())
+        record = cstp24.state_record(self._file_size, self._file_crc, index + 1)
+        descriptor, tmp = tempfile.mkstemp(prefix=self.state.name + ".",
+                                           dir=self.state.parent)
+        with os.fdopen(descriptor, "wb") as stage:
+            stage.write(record)
+            stage.flush()
+            os.fsync(stage.fileno())
+        os.replace(tmp, self.state)
+        directory = os.open(self.state.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def finalize(self, file_crc):
+        content = self.part.read_bytes() if self._file_size else b""
+        if len(content) != self._file_size or cstp24.crc32(content) != file_crc:
+            return False
+        self.output.save(content, air_compressed=False)
+        self.saved_bytes = len(content)
+        self._reset()
+        return True
+
+
+def perform_transfer_cstp24(args, content, output, open_radio, ui):
+    if ui is not None:
+        ui.color((0, 0, 1))
+    console("Opening {} radio: channel74 rate={} PA=MIN (CSTP-24)".format(
+        args.role.upper(), args.rate))
+    session = int.from_bytes(os.urandom(2), "little") or 1
+    with open_radio(args.role, args.rate, args.hardware_checked) as radio:
+        padded = PadRadio(radio)
+        if args.role == "tx":
+            total = (len(content) + cstp24.CHUNK_BYTES - 1) // cstp24.CHUNK_BYTES
+            console("TX radio ready; {} bytes as {} chunk(s) of 4 KB".format(
+                len(content), total))
+            observed = CstpTxRadio(padded, args.debug, ui=ui)
+            stats = cstp24.send_session(
+                lambda i: content[i * cstp24.CHUNK_BYTES:(i + 1) * cstp24.CHUNK_BYTES],
+                total, len(content), cstp24.crc32(content), session,
+                observed, time.monotonic)
+            report = {"mode": "tx", "protocol": "CSTP-24", "bytes": len(content),
+                      "chunks": stats["chunks"], "resumed_from": stats["resumed_from"],
+                      "data_frames": stats["data_frames"], "nacks": stats["nacks"],
+                      "chunk_retries": stats["chunk_retries"],
+                      "remote_file_ok": True,
+                      "crc32": "{:08x}".format(cstp24.crc32(content))}
+        else:
+            files = CstpReceiverFiles(output)
+            console("RX radio ready; waiting for SESSION_INIT ({}s)".format(
+                int(cstp24.START_TIMEOUT)))
+            observed_rx = LoggedRxRadio(padded, args.debug, ui=ui) if args.batch else padded
+            stats = cstp24.receive_session(
+                observed_rx, time.monotonic, files.lookup, files.commit,
+                files.finalize)
+            report = {"mode": "rx", "protocol": "CSTP-24",
+                      "bytes": files.saved_bytes, "chunks": stats["chunks"],
+                      "resumed_from": stats["resumed_from"], "nacks": stats["nacks"],
+                      "local_file_saved": True, "output": str(output.path)}
+    return report
 
 
 def perform_transfer(args, content, output, open_radio, ui):

@@ -159,7 +159,32 @@ slow large transfers, especially debug on a Pi; existing deadlines still apply.
 A printed SAVED observation is provisional until radio cleanup succeeds and
 final JSON is emitted. Red/errors mean unconfirmed, not guaranteed remote loss.
 
-## PT/1 wire contract
+## CSTP-24 transport (current)
+
+`quick_mode.py tx/rx` now speaks **CSTP-24** (Chunked Session Transfer Protocol,
+team specification CSTP-24) by default; `--legacy-pt1` keeps the superseded
+PT/1 below for peers that have not updated. Both peers must run the same
+protocol.
+
+- 5-byte little-endian header (`kind`, `session`, `sequence`) + up to 27-byte
+  body per 32-byte ESB frame (`cstp24.py`, pure struct/zlib/typing).
+- Files move as independent 4 KB chunks: per-chunk zlib compression with an
+  incompressible-data guard, CRC-32 per chunk, burst transmission, and
+  selective-repeat recovery through the 152-bit `CHUNK_NACK` bitmap.
+- Every acknowledged chunk is durable: the receiver commits to `.cstp-part`
+  plus an atomic 20-byte `.cstp-state` checkpoint before `CHUNK_ACK`, so an
+  interrupted transfer resumes at the exact next unverified chunk
+  (`OK_RESUME`). A changed source file or a corrupt checkpoint safely falls
+  back to a fresh transfer.
+- Whole-file CRC-32 closes the session (`SESSION_END` / `SESSION_END_ACK`);
+  the RX file is published atomically only after it verifies.
+- Radio frames are zero-padded to the adapter's fixed 32-byte payload;
+  enabling nRF24 Dynamic Payload Length (spec section 6) is a hardware-tuning
+  follow-up. Host tests cover framing, the compression guard, selective
+  retransmission, CRC-failure retry, resume, duplicate-START re-ACK and abort.
+  No hardware timing (T_ACK_WAIT 15 ms, T_GAP 5 ms) is validated yet.
+
+## PT/1 wire contract (legacy, superseded by CSTP-24)
 
 This is an original, explicitly different protocol, incompatible with both
 unlicensed references and legacy host framing. All multi-byte integers are
