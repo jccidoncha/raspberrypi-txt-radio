@@ -1,0 +1,16 @@
+[Unit]
+Description=PT/1 USB radio autorun
+After=local-fs.target pigpiod.service
+Wants=pigpiod.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/pt-radio.env
+WorkingDirectory=@REPO@
+ExecStart=@REPO@/.venv/bin/python @REPO@/usb_autorun.py
+# Root is needed for mount/umount of the stick; the radio needs only local pigpiod.
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
