@@ -345,7 +345,8 @@ class FileCliTests(unittest.TestCase):
                         patch("quick_mode.time.monotonic", clock.now), \
                         redirect_stdout(stdout):
                     self.assertEqual(quick_mode.main(
-                        [role, str(path), "--rate", "250k", "--hardware-checked"]), 0)
+                        [role, str(path), "--rate", "250k", "--hardware-checked",
+                         "--legacy-pt1"]), 0)
                 self.assertIn('"protocol": "PT/1"', stdout.getvalue())
             self.assertEqual(target.read_bytes(), source.read_bytes())
 
@@ -372,7 +373,8 @@ import transfer, quick_mode, radio_adapter
                     patch("quick_mode.time.monotonic", clock.now), \
                     redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()):
                 self.assertEqual(quick_mode.main(
-                    ["rx", str(target), "--rate", "250k", "--hardware-checked"]), 1)
+                    ["rx", str(target), "--rate", "250k", "--hardware-checked",
+                     "--legacy-pt1"]), 1)
             self.assertEqual(list(Path(folder).iterdir()), [])
             manager.__exit__.assert_called_once()
 

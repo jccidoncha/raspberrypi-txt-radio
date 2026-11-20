@@ -145,7 +145,8 @@ import quick_mode
                         patch.object(q.time, 'monotonic', clock.now), \
                         redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()):
                     status = q.main(['tx',str(path),'--rate','250k',
-                                     '--hardware-checked','--button-led'])
+                                     '--hardware-checked','--button-led',
+                                     '--legacy-pt1'])
                 self.assertEqual(status, int(fail))
                 ui.wait.assert_called_once()
                 opening.assert_called_once()
