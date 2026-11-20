@@ -260,3 +260,17 @@ probe runner explicitly. The three independent findings are addressed by this
 local repair; these author checks do not constitute another independent review.
 No further audit round is performed. No reference
 material or preliminary notes belong in a commit. No push or merge.
+
+## Unattended USB flow (usb_autorun.py)
+
+Per Pi: a service watches for a USB stick and runs `quick_mode.py` around it.
+One `.txt` in the stick root means TX of that file; no root `.txt` means RX. The TX
+file is copied to the SD (compared byte for byte) before sending. RX saves to the SD
+first (FAT32/exFAT lack `os.link`), then the file is copied to `<stick>/received/rx_NNNN.txt`,
+verified, and the stick is unmounted. An existing file is never overwritten;
+identical content already on the stick counts as done. Setup and rules are in
+`deploy/install.sh` and `/etc/pt-radio.env` (`PT_RATE` and the owner's
+`PT_HARDWARE_CHECKED=yes` are required; empty means the service refuses to start a transfer).
+It defaults to `quick_mode.py --batch`, the only mode with a button and LED on RX.
+Press the button on each Pi once to start (the service passes `--auto-finish`: no extra press). The LED turns green only after the stick copy is verified and unmounted (TX: after the remote SAVED receipt), red on failure. A received file stays on the SD until verified on a stick, and is delivered first when an RX stick is next inserted; it never goes to a stick with a root `.txt`.
+Not tested on hardware. The single USB port is in host mode here, so the USB console is gone.
