@@ -272,5 +272,5 @@ identical content already on the stick counts as done. Setup and rules are in
 `deploy/install.sh` and `/etc/pt-radio.env` (`PT_RATE` and the owner's
 `PT_HARDWARE_CHECKED=yes` are required; empty means the service refuses to start a transfer).
 It defaults to `quick_mode.py --batch`, the only mode with a button and LED on RX.
-Press the button on each Pi to start; the final LED is green (copy verified) or red.
+Press the button on each Pi once to start (the service passes `--auto-finish`: no extra press). The LED turns green only after the stick copy is verified and unmounted (TX: after the remote SAVED receipt), red on failure. A received file stays on the SD until verified on a stick, and is delivered first when an RX stick is next inserted; it never goes to a stick with a root `.txt`.
 Not tested on hardware. The single USB port is in host mode here, so the USB console is gone.

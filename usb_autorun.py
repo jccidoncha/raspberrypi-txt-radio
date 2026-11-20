@@ -54,7 +54,7 @@ def usb_candidates(lsblk):
 
 
 def find_usb():
-    out = run("lsblk", "-J", "-o", "PATH,TYPE,TRAN,FSTYPE,MOUNTPOINT,LABEL").stdout
+    out = run("lsblk", "-J", "--tree", "-o", "PATH,TYPE,TRAN,FSTYPE,MOUNTPOINT,LABEL").stdout
     found = usb_candidates(json.loads(out))
     if not found:
         return None
@@ -73,7 +73,11 @@ def mount_usb(device, writable=False):
         run("mount", "-t", device["fstype"], "-o", "ro,nosuid,nodev,noexec",
             device["path"], str(MOUNT))
     if writable:
-        run("mount", "-o", "remount,rw,sync", str(MOUNT))
+        remount_rw()
+
+
+def remount_rw():
+    run("mount", "-o", "remount,rw,sync", str(MOUNT))
 
 
 def unmount_usb():
@@ -146,7 +150,8 @@ def next_rx_path(rx_dir):
     rx_dir = Path(rx_dir)
     rx_dir.mkdir(parents=True, exist_ok=True)
     number = 1
-    while (rx_dir / "rx_{:04d}.txt".format(number)).exists():
+    while any((rx_dir / "rx_{:04d}{}".format(number, ext)).exists()
+              for ext in (".txt", ".delivered")):
         number += 1
     return rx_dir / "rx_{:04d}.txt".format(number)
 
@@ -155,9 +160,12 @@ def save_to_usb(received, usb_root):
     """Copy a received file into <usb>/received/. Identical content already there
     counts as done; a different file never gets overwritten. Returns the USB path."""
     out = Path(usb_root) / RECEIVED_DIR
+    if out.is_symlink() or (out.exists() and not out.is_dir()):
+        raise FlowError("'{}' on the stick is a symlink or not a directory".format(RECEIVED_DIR))
     out.mkdir(exist_ok=True)
     for existing in sorted(out.glob("*.txt")):
-        if not existing.name.startswith(".") and same_bytes(received, existing):
+        if (not existing.name.startswith(".") and existing.is_file()
+                and not existing.is_symlink() and same_bytes(received, existing)):
             return existing
     number = 1
     while os.path.lexists(out / "rx_{:04d}.txt".format(number)):
@@ -182,7 +190,7 @@ def config():
 def radio_command(role, path, rate, extra):
     python = os.environ.get("PT_PYTHON", sys.executable)
     return [python, str(REPO / "quick_mode.py"), role, str(path),
-            "--rate", rate, "--hardware-checked", *extra]
+            "--rate", rate, "--hardware-checked", "--auto-finish", *extra]
 
 
 def run_radio(role, path, rate, extra):
@@ -207,9 +215,31 @@ GREEN, RED = (0, 1, 0), (1, 0, 0)
 
 # ---- one cycle -------------------------------------------------------------
 
+def pending_files(rx_dir):
+    """Received on the SD but not yet verified on a stick."""
+    rx_dir = Path(rx_dir)
+    return sorted(rx_dir.glob("rx_*.txt")) if rx_dir.is_dir() else []
+
+
+def deliver_pending(device, rx_dir):
+    """Copy every pending SD file to the stick. The stick must be an RX stick
+    (no root .txt): a TX stick or a swapped-in TX stick never receives files."""
+    mount_usb(device)
+    if root_txt_files(MOUNT):
+        unmount_usb()
+        raise FlowError("stick has a root .txt; not delivering received files to a TX stick")
+    remount_rw()
+    for received in pending_files(rx_dir):
+        target = save_to_usb(received, MOUNT)
+        log("verified on USB: {}/{}".format(RECEIVED_DIR, target.name))
+        received.rename(received.with_suffix(".delivered"))
+    unmount_usb()
+
+
 def cycle(device):
     """Returns True on a fully completed cycle. Raises FlowError on a failure."""
     rate, extra = config()
+    rx_dir = STATE / "rx"
     mount_usb(device)
     files = root_txt_files(MOUNT)
     if len(files) > 1:
@@ -224,17 +254,17 @@ def cycle(device):
         return True
     log("role RX: no .txt on the stick root")
     unmount_usb()
-    rx_dir = STATE / "rx"
+    if pending_files(rx_dir):
+        log("delivering earlier received file(s) first; no radio this round")
+        deliver_pending(device, rx_dir)
+        return True
     received = next_rx_path(rx_dir)
     if run_radio("rx", received, rate, extra) != 0 or not received.exists():
         raise FlowError("RX failed; nothing saved")
     device = find_usb()
     if device is None:
-        raise FlowError("USB removed before the received file could be copied; file kept on SD: {}".format(received))
-    mount_usb(device, writable=True)
-    target = save_to_usb(received, MOUNT)
-    unmount_usb()
-    log("RX copied and verified on USB: {}/{}".format(RECEIVED_DIR, target.name))
+        raise FlowError("USB removed before delivery; file kept on SD and delivered on next stick")
+    deliver_pending(device, rx_dir)
     return True
 
 
@@ -243,37 +273,48 @@ def wait_removed():
         time.sleep(1)
 
 
+def step():
+    """One main-loop iteration. No GPIO (LED) is touched until config is valid."""
+    try:
+        config()
+    except FlowError as error:
+        log("CONFIG ERROR: {}".format(error))
+        time.sleep(10)
+        return
+    try:
+        device = find_usb()
+    except FlowError as error:
+        log("ERROR: {}".format(error))
+        show(RED, 3)
+        time.sleep(3)
+        return
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        log("ERROR reading devices: {}".format(error))
+        time.sleep(3)
+        return
+    if device is None:
+        time.sleep(1)
+        return
+    time.sleep(1)  # let the stick settle
+    try:
+        cycle(device)
+        show(GREEN)
+        log("done; remove the stick to arm the next round")
+        wait_removed()
+    except (FlowError, OSError, subprocess.CalledProcessError) as error:
+        log("ERROR: {}".format(error))
+        try:
+            unmount_usb()
+        except Exception:
+            pass
+        show(RED)
+        time.sleep(2)
+
+
 def main():
     log("waiting for USB stick")
     while True:
-        try:
-            device = find_usb()
-        except FlowError as error:
-            log("ERROR: {}".format(error))
-            show(RED, 3)
-            time.sleep(3)
-            continue
-        except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
-            log("ERROR reading devices: {}".format(error))
-            time.sleep(3)
-            continue
-        if device is None:
-            time.sleep(1)
-            continue
-        time.sleep(1)  # let the stick settle
-        try:
-            cycle(device)
-            show(GREEN)
-            log("done; remove the stick to arm the next round")
-            wait_removed()
-        except (FlowError, OSError, subprocess.CalledProcessError) as error:
-            log("ERROR: {}".format(error))
-            try:
-                unmount_usb()
-            except Exception:
-                pass
-            show(RED)
-            time.sleep(2)
+        step()
 
 
 if __name__ == "__main__":

@@ -339,8 +339,9 @@ class ButtonLed:
     BLINK_INTERVAL = 0.25
     ACTIVITY_MIN_INTERVAL = 0.04
 
-    def __init__(self, role="tx", interactive_led=False):
+    def __init__(self, role="tx", interactive_led=False, auto_finish=False):
         self.role = role.upper()
+        self.auto_finish = auto_finish
         self.interactive_led = interactive_led
         self.pi = None
         self.io = None
@@ -444,6 +445,9 @@ class ButtonLed:
 
     def result(self, saved):
         try:
+            if saved and self.auto_finish:
+                self.color((0, 0, 0))  # the unattended wrapper shows the final green
+                return
             self.color((0, 1, 0) if saved else (1, 0, 0))
             if saved and self.interactive_led:
                 print("Blinking GREEN: transfer complete! Press and release button to finish.",
@@ -493,6 +497,8 @@ def radio_main(argv):
                         help="TX/RX: common-GND RGB BCM17/27/22 and button BCM23/GND")
     parser.add_argument("--batch", action="store_true",
                         help="enable directory/large-file mode, air compression and interactive LEDs")
+    parser.add_argument("--auto-finish", action="store_true",
+                        help="unattended: no extra button press and no green on success; caller signals the end")
     parser.add_argument("--debug", action="store_true",
                         help="TX: log every request/link ACK/reply; never file contents")
     args = parser.parse_args(argv)
@@ -513,7 +519,7 @@ def radio_main(argv):
         from radio_adapter import open_radio
 
         use_ui = args.button_led and (args.role == "tx" or args.batch)
-        with exclusive_radio(), (ButtonLed(args.role, interactive_led=args.batch) if use_ui else nullcontext()) as ui:
+        with exclusive_radio(), (ButtonLed(args.role, interactive_led=args.batch, auto_finish=args.auto_finish) if use_ui else nullcontext()) as ui:
             if ui is not None:
                 ui.wait()
             try:

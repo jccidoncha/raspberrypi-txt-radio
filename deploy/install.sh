@@ -8,9 +8,16 @@ set -eu
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 [ -x "$REPO/.venv/bin/python" ] || { echo "missing $REPO/.venv (see README install steps)" >&2; exit 1; }
 CMDLINE=/boot/firmware/cmdline.txt
-if grep -q 'g_serial' "$CMDLINE" 2>/dev/null; then
-  echo "cmdline.txt loads g_serial (USB console). The single USB port cannot also host a stick." >&2
-  echo "Revert that console setup first (keep a backup of cmdline.txt/config.txt)." >&2
+CFG=/boot/firmware/config.txt
+if grep -q 'g_serial\|g_ether\|libcomposite' "$CMDLINE" 2>/dev/null \
+   || grep -rqs '^[[:space:]]*\(g_\|libcomposite\)' /etc/modules-load.d /etc/modules 2>/dev/null \
+   || lsmod | grep -q '^\(g_\|libcomposite\)'; then
+  echo "A USB gadget (console/network) is configured or loaded. The single USB port cannot also host a stick." >&2
+  echo "Revert that setup first (keep a backup of cmdline.txt/config.txt) and reboot." >&2
+  exit 1
+fi
+if grep -qs '^[[:space:]]*dtoverlay=dwc2.*dr_mode=peripheral' "$CFG"; then
+  echo "config.txt forces USB peripheral mode; the stick needs host mode. Fix and reboot." >&2
   exit 1
 fi
 if [ ! -f /etc/pt-radio.env ]; then
@@ -31,12 +38,13 @@ systemctl daemon-reload
 systemctl enable pt-radio.service
 systemctl enable pigpiod.service 2>/dev/null || echo "enable pigpiod yourself (local-only)" >&2
 if [ "${1:-}" = "--disable-radios" ]; then
-  CFG=/boot/firmware/config.txt
   cp -n "$CFG" "$CFG.pt-backup"
-  printf '[all]\n' >> "$CFG"
-  for line in dtoverlay=disable-wifi dtoverlay=disable-bt; do
-    grep -qx "$line" "$CFG" || printf '%s\n' "$line" >> "$CFG"
-  done
+  if ! grep -q '^# pt-radio begin' "$CFG"; then
+    {
+      printf '\n# pt-radio begin\n[all]\n'
+      printf 'dtoverlay=disable-wifi\ndtoverlay=disable-bt\n# pt-radio end\n'
+    } >> "$CFG"
+  fi
   systemctl disable hciuart.service bluetooth.service 2>/dev/null || true
   echo "Wi-Fi/Bluetooth disabled after reboot. SSH over Wi-Fi will stop working."
 fi

@@ -132,6 +132,7 @@ class UsbAutorunTests(unittest.TestCase):
         patches = [mock.patch.dict(os.environ, env), mock.patch.object(ua, "MOUNT", usb),
                    mock.patch.object(ua, "STATE", self.root / "state"),
                    mock.patch.object(ua, "mount_usb"), mock.patch.object(ua, "unmount_usb"),
+                   mock.patch.object(ua, "remount_rw"),
                    mock.patch.object(ua, "find_usb", return_value=dev),
                    mock.patch.object(ua, "run_radio", fake_radio)]
         for p in patches:
@@ -161,11 +162,89 @@ class UsbAutorunTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "rx")
         self.assertTrue(str(calls[0][1]).startswith(str(self.root / "state")))
         self.assertEqual((usb / "received" / "rx_0001.txt").read_bytes(), b"got")
+        state_rx = self.root / "state" / "rx"
+        self.assertEqual(sorted(p.name for p in state_rx.iterdir()), ["rx_0001.delivered"])
 
     def test_cycle_rx_failure_writes_nothing_to_usb(self):
         with self.assertRaises(ua.FlowError):
             self._cycle({}, radio_code=1)
         self.assertFalse((self.root / "usb" / "received").exists())
+
+    def test_find_usb_requests_tree_output(self):
+        import json
+        with mock.patch.object(ua, "run") as fake:
+            fake.return_value.stdout = json.dumps(LSBLK)
+            self.assertEqual(ua.find_usb()["path"], "/dev/sda1")
+        self.assertIn("--tree", fake.call_args[0])
+
+    def test_step_without_config_never_touches_led(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ua, "show") as show, \
+                mock.patch.object(ua, "find_usb", side_effect=ua.FlowError("x")), \
+                mock.patch.object(ua.time, "sleep"):
+            ua.step()
+        show.assert_not_called()
+
+    def test_failed_delivery_is_retried_without_radio(self):
+        with self.assertRaises(OSError):
+            with mock.patch.object(ua, "save_to_usb", side_effect=OSError("boom")):
+                self._cycle({}, rx_writes=b"got")
+        pending = list((self.root / "state" / "rx").glob("rx_*.txt"))
+        self.assertEqual(len(pending), 1)
+        radio = mock.Mock()
+        usb = self.root / "usb"
+        dev = {"path": "/dev/sda1", "fstype": "vfat", "mountpoint": None}
+        with mock.patch.object(ua, "run_radio", radio):
+            self.assertTrue(ua.cycle(dev))
+        radio.assert_not_called()
+        self.assertEqual((usb / "received" / "rx_0001.txt").read_bytes(), b"got")
+        self.assertEqual(list((self.root / "state" / "rx").glob("rx_*.txt")), [])
+
+    def test_never_deliver_to_stick_with_root_txt(self):
+        with self.assertRaises(OSError):
+            with mock.patch.object(ua, "save_to_usb", side_effect=OSError("boom")):
+                self._cycle({}, rx_writes=b"got")
+        (self.root / "usb" / "tx.txt").write_bytes(b"mine")
+        with mock.patch.object(ua, "save_to_usb") as save, \
+                mock.patch.object(ua, "stage_tx", return_value=Path("x")), \
+                mock.patch.object(ua, "run_radio", return_value=0):
+            ua.cycle({"path": "/dev/sdb1", "fstype": "vfat", "mountpoint": None})
+        save.assert_not_called()
+        with self.assertRaises(ua.FlowError):
+            ua.deliver_pending({"path": "/dev/sdb1", "fstype": "vfat", "mountpoint": None},
+                               self.root / "state" / "rx")
+
+    def test_received_symlink_rejected(self):
+        usb = self.root / "usb"
+        usb.mkdir()
+        sd = self.root / "sd"
+        sd.mkdir()
+        (usb / "received").symlink_to(sd)
+        rec = self.root / "rx.txt"
+        rec.write_bytes(b"x")
+        with self.assertRaises(ua.FlowError):
+            ua.save_to_usb(rec, usb)
+
+    def test_txt_symlink_not_counted_as_copy(self):
+        usb = self.root / "usb"
+        (usb / "received").mkdir(parents=True)
+        rec = self.root / "rx.txt"
+        rec.write_bytes(b"x")
+        (usb / "received" / "rx_0001.txt").symlink_to(rec)
+        target = ua.save_to_usb(rec, usb)
+        self.assertNotEqual(target.name, "rx_0001.txt")
+        self.assertFalse(target.is_symlink())
+
+    def test_radio_command_auto_finish(self):
+        self.assertIn("--auto-finish", ua.radio_command("tx", "f.txt", "2m", []))
+
+    def test_auto_finish_skips_green_and_press(self):
+        import quick_mode
+        led = quick_mode.ButtonLed("rx", interactive_led=True, auto_finish=True)
+        with mock.patch.object(led, "color") as color, mock.patch.object(led, "_stable") as stable:
+            led.result(True)
+        color.assert_called_once_with((0, 0, 0))
+        stable.assert_not_called()
 
 
 if __name__ == "__main__":
